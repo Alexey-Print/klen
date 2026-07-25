@@ -1,4 +1,4 @@
-name: Сборка APK
+name: Сборка АРК
 
 on:
   workflow_dispatch:
@@ -27,13 +27,15 @@ jobs:
       - name: Системные пакеты
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends git zip unzip autoconf automake libtool pkg-config zlib1g-dev libncurses-dev cmake libffi-dev libssl-dev build-essential ccache
+          sudo apt-get install -y --no-install-recommends \
+            git zip unzip autoconf automake libtool libtool-bin pkg-config \
+            zlib1g-dev libncurses-dev cmake libffi-dev libssl-dev build-essential ccache
 
       - name: Buildozer и зависимости
         run: |
-          python -m pip install --upgrade pip setuptools wheel Cython==0.29.36
-          pip install git+https://github.com/kivy/buildozer.git
-          pip install git+https://github.com/kivy/python-for-android.git
+          python -m pip install --upgrade pip setuptools wheel
+          pip install Cython==0.29.36
+          pip install buildozer==1.5.0
 
       - name: Кэш
         uses: actions/cache@v4
@@ -41,7 +43,7 @@ jobs:
           path: |
             ~/.buildozer
             .buildozer
-          key: bz-${{ hashFiles('buildozer.spec') }}
+          key: bz-2024stable-${{ hashFiles('buildozer.spec') }}
 
       - name: Собрать APK
         run: |
