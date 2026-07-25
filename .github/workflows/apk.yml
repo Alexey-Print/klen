@@ -28,8 +28,8 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            git zip unzip autoconf automake libtool libtool-bin pkg-config \
-            zlib1g-dev libncurses-dev cmake libffi-dev libssl-dev build-essential ccache
+            git zip unzip autoconf automake libtool libtool-bin libltdl-dev pkg-config \
+            zlib1g-dev libncurses-dev cmake libffi-dev libssl-dev build-essential ccache m4
 
       - name: Buildozer и зависимости
         run: |
@@ -43,7 +43,7 @@ jobs:
           path: |
             ~/.buildozer
             .buildozer
-          key: bz-2024stable-${{ hashFiles('buildozer.spec') }}
+          key: bz-2024stable-v2-${{ hashFiles('buildozer.spec') }}
 
       - name: Собрать APK
         run: |
