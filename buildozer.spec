@@ -1,54 +1,32 @@
-name: Сборка APK
+[app]
 
-on:
-  workflow_dispatch:
-  push:
-    branches: [main]
+title = ЖСК КЛЕН
+package.name = klenfoto
+package.domain = ru.klen
 
-jobs:
-  build:
-    runs-on: ubuntu-latest
-    timeout-minutes: 120
-    steps:
-      - name: Забрать код
-        uses: actions/checkout@v4
+source.dir = .
+source.include_exts = py,png,jpg,jpeg,ttf,json
 
-      - name: Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
+version = 1.0
 
-      - name: Java
-        uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: '17'
+requirements = python3,kivy==2.3.0,pillow,pyjnius,android
 
-      - name: Системные пакеты
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends git zip unzip openjdk-17-jdk autoconf automake libtool pkg-config zlib1g-dev libncurses-dev cmake libffi-dev libssl-dev build-essential ccache patch
+orientation = portrait
+fullscreen = 0
 
-      - name: Buildozer
-        run: |
-          python -m pip install --upgrade pip setuptools wheel
-          pip install buildozer==1.5.0 "cython==0.29.36" virtualenv
+icon.filename = %(source.dir)s/icon.png
+android.presplash_color = #2EA854
 
-      - name: Кэш сборки
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.buildozer
-            ~/.gradle
-          key: buildozer-${{ hashFiles('buildozer.spec') }}
-          restore-keys: buildozer-
+android.permissions = CAMERA,INTERNET,ACCESS_NETWORK_STATE,ACCESS_FINE_LOCATION,ACCESS_COARSE_LOCATION,READ_EXTERNAL_STORAGE,WRITE_EXTERNAL_STORAGE,READ_MEDIA_IMAGES
 
-      - name: Собрать APK
-        run: buildozer -v android debug
+android.api = 34
+android.minapi = 24
+android.ndk = 25b
+android.archs = arm64-v8a
+android.accept_sdk_license = True
+android.allow_backup = True
 
-      - name: Выложить APK
-        uses: actions/upload-artifact@v4
-        with:
-          name: KLEN-APK
-          path: bin/*.apk
-          if-no-files-found: error
+[buildozer]
+
+log_level = 2
+warn_on_root = 0
