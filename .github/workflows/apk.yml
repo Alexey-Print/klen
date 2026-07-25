@@ -24,16 +24,32 @@ jobs:
           distribution: temurin
           java-version: '17'
 
-      - name: Сборка APK через готовый образ
-        uses: ArtemSBulgakov/buildozer-action@v1
-        id: buildozer
+      - name: Системные пакеты
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends git zip unzip autoconf automake libtool pkg-config zlib1g-dev libncurses-dev cmake libffi-dev libssl-dev build-essential ccache
+
+      - name: Buildozer и зависимости
+        run: |
+          python -m pip install --upgrade pip setuptools wheel Cython==0.29.36
+          pip install git+https://github.com/kivy/buildozer.git
+          pip install git+https://github.com/kivy/python-for-android.git
+
+      - name: Кэш
+        uses: actions/cache@v4
         with:
-          command: buildozer android debug
-          buildozer_version: stable
+          path: |
+            ~/.buildozer
+            .buildozer
+          key: bz-${{ hashFiles('buildozer.spec') }}
+
+      - name: Собрать APK
+        run: |
+          yes | buildozer android debug || buildozer android debug
 
       - name: Выложить APK
         uses: actions/upload-artifact@v4
         with:
           name: KLEN-APK
-          path: ${{ steps.buildozer.outputs.filename }}
+          path: bin/*.apk
           if-no-files-found: error
