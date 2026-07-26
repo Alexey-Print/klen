@@ -4,7 +4,7 @@ package.name = klenfoto
 package.domain = ru.klen
 source.dir = .
 source.include_exts = py,png,jpg,jpeg,ttf,json
-version = 1.0
+version = 1.1
 requirements = python3,kivy==2.3.0,pillow,pyjnius,android
 orientation = portrait
 fullscreen = 0
