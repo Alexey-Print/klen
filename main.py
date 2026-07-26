@@ -152,9 +152,23 @@ else:
     if os.path.isdir(_SUB):
         BASE_DIR = _SUB
 DATA_FILE = os.path.join(BASE_DIR, "photo_sender_data.json")
-LOGO_FILE = os.path.join(BASE_DIR, "logo.png")  # логотип ЖСК (если положен рядом)
-LOGO_MARK = os.path.join(BASE_DIR, "logo_mark.png")  # эмблема для плашки
-FON_FILE = os.path.join(BASE_DIR, "fon.jpg")  # картинка-фон главной (если есть)
+def _find_asset(name):
+    # Ищем ресурс сначала в папке данных (куда он должен копироваться
+    # при первом запуске), а затем прямо в папке с программой (куда он
+    # вшит при сборке). Так фон и логотип показываются, даже если
+    # копирование при первом запуске почему-то не сработало.
+    for _d in (BASE_DIR, APP_DIR):
+        try:
+            _p = os.path.join(_d, name)
+            if os.path.isfile(_p):
+                return _p
+        except Exception:
+            pass
+    return os.path.join(BASE_DIR, name)
+
+LOGO_FILE = _find_asset("logo.png")       # логотип ЖСК (если положен рядом)
+LOGO_MARK = _find_asset("logo_mark.png")  # эмблема для плашки
+FON_FILE  = _find_asset("fon.jpg")        # картинка-фон главной (если есть)
 
 # =====================================================================
 #  ЭМБЛЕМА ЖСК "КЛЕН" — вшита прямо в код, отдельный файл не нужен.
