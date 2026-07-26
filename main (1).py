@@ -1,0 +1,5962 @@
+# -*- coding: utf-8 -*-
+# =====================================================================
+#  ФОТО-ОТПРАВЩИК  —  шаблон-основа (Kivy/Python)
+# =====================================================================
+#  Сценарий:
+#    запуск -> штатная камера -> проверка (Отправить/Переснять)
+#    -> способ (MMS / MAX) -> архив (с геолокацией и удалением)
+#
+#  Хранение данных: photo_sender_data.json (рядом со скриптом)
+#  Фото: папка photo_archive/ (рядом со скриптом)
+#
+#  ВАЖНО (см. заметки внизу файла):
+#   - для камеры нужен модуль plyer (в Pydroid: pip install plyer)
+#   - штатная камера/поделиться/MMS полноценно работают на устройстве,
+#     а не в десктоп-эмуляции
+#   - эмодзи НЕ используем (рендерятся квадратами), рубль = \u20bd
+# =====================================================================
+
+import os
+import json
+import time
+import shutil
+import threading
+from datetime import datetime
+
+from kivy.app import App
+from kivy.core.window import Window
+from kivy.clock import Clock, mainthread
+from kivy.metrics import dp
+from kivy.utils import get_color_from_hex as H
+
+from kivy.uix.screenmanager import ScreenManager, Screen, SlideTransition
+from kivy.uix.boxlayout import BoxLayout
+from kivy.uix.floatlayout import FloatLayout
+from kivy.uix.gridlayout import GridLayout
+from kivy.uix.scrollview import ScrollView
+from kivy.uix.label import Label
+from kivy.uix.button import Button
+from kivy.uix.image import Image
+from kivy.uix.textinput import TextInput
+from kivy.uix.popup import Popup
+from kivy.uix.behaviors import ButtonBehavior
+from kivy.uix.scatterlayout import ScatterLayout
+from kivy.uix.stencilview import StencilView
+
+
+def _meter_upright(p):
+    try:
+        import os as _os
+        from PIL import Image as _PImg, ImageOps as _POps
+        if not p or not _os.path.exists(p):
+            return p
+        up = p + ".up.jpg"
+        if _os.path.exists(up) and _os.path.getmtime(up) >= _os.path.getmtime(p):
+            return up
+        _img = _PImg.open(p)
+        _img = _POps.exif_transpose(_img)
+        _img.convert("RGB").save(up, "JPEG", quality=90)
+        return up
+    except Exception:
+        return p
+
+class ZoomFrame(StencilView):
+    """Рамка для фото: всё, что вылезает при зуме и перетаскивании,
+    обрезается по её краям и не налезает на кнопки.
+    В углу — значок с диагональной стрелкой: подсказка, что фото
+    можно увеличивать пальцами и двигать."""
+
+    def __init__(self, **kw):
+        super().__init__(**kw)
+        self.zoom = ScatterLayout(do_rotation=False, do_translation=True,
+                                  scale_min=1.0, scale_max=8.0,
+                                  size_hint=(None, None))
+        self.img = Image(allow_stretch=True, keep_ratio=True)
+        self.zoom.add_widget(self.img)
+        self.add_widget(self.zoom)
+
+        # Значок рисуем линиями: эмодзи в Pydroid не рендерятся.
+        with self.canvas.after:
+            self._bgc = Color(0, 0, 0, 0.45)
+            self._bg = RoundedRectangle(radius=[8])
+            self._lc = Color(1, 1, 1, 0.85)
+            self._l1 = Line(width=1.8)   # диагональ
+            self._l2 = Line(width=1.8)   # наконечник сверху справа
+            self._l3 = Line(width=1.8)   # наконечник снизу слева
+
+        self.bind(size=self._fit, pos=self._fit)
+
+    def _fit(self, *a):
+        self.zoom.size = self.size
+        self.zoom.pos = self.pos
+
+        # значок в правом нижнем углу рамки
+        s = dp(34)
+        pad = dp(8)
+        bx = self.right - s - pad
+        by = self.y + pad
+        self._bg.pos = (bx, by)
+        self._bg.size = (s, s)
+
+        m = dp(9)
+        x0, y0 = bx + m, by + m
+        x1, y1 = bx + s - m, by + s - m
+        a_ = dp(7)
+        self._l1.points = [x0, y0, x1, y1]
+        self._l2.points = [x1 - a_, y1, x1, y1, x1, y1 - a_]
+        self._l3.points = [x0 + a_, y0, x0, y0, x0, y0 + a_]
+from kivy.graphics import Color, Rectangle, RoundedRectangle, Line
+
+# ---------------------------------------------------------------------
+#  ПУТИ И ФАЙЛЫ
+# ---------------------------------------------------------------------
+APP_DIR = os.path.dirname(os.path.abspath(__file__))
+
+# Внутри APK папка с программой только для чтения, поэтому данные
+# храним в собственной папке приложения на карте памяти.
+# В Pydroid всё работает по-старому (переменной ANDROID_ARGUMENT там нет).
+_IS_APK = bool(os.environ.get("ANDROID_ARGUMENT"))
+
+
+def _apk_data_dir():
+    try:
+        from jnius import autoclass
+        act = autoclass("org.kivy.android.PythonActivity").mActivity
+        d = act.getExternalFilesDir(None)
+        if d is not None:
+            return d.getAbsolutePath()
+        return act.getFilesDir().getAbsolutePath()
+    except Exception:
+        return None
+
+
+if _IS_APK:
+    BASE_DIR = _apk_data_dir() or os.path.join(APP_DIR, "данные")
+    try:
+        os.makedirs(BASE_DIR, exist_ok=True)
+    except Exception:
+        pass
+    # При первом запуске переносим вшитые ресурсы рядом с данными.
+    for _n in ("logo.png", "logo_mark.png", "fon.jpg"):
+        try:
+            _src = os.path.join(APP_DIR, _n)
+            _dst = os.path.join(BASE_DIR, _n)
+            if os.path.isfile(_src) and not os.path.isfile(_dst):
+                shutil.copy2(_src, _dst)
+        except Exception:
+            pass
+else:
+    BASE_DIR = APP_DIR
+    # Служебные файлы лежат в подпапке «файлы» (если она есть).
+    _SUB = os.path.join(BASE_DIR, "файлы")
+    if os.path.isdir(_SUB):
+        BASE_DIR = _SUB
+DATA_FILE = os.path.join(BASE_DIR, "photo_sender_data.json")
+def _find_asset(name):
+    # Ищем ресурс сначала в папке данных (куда он должен копироваться
+    # при первом запуске), а затем прямо в папке с программой (куда он
+    # вшит при сборке). Так фон и логотип показываются, даже если
+    # копирование при первом запуске почему-то не сработало.
+    for _d in (BASE_DIR, APP_DIR):
+        try:
+            _p = os.path.join(_d, name)
+            if os.path.isfile(_p):
+                return _p
+        except Exception:
+            pass
+    return os.path.join(BASE_DIR, name)
+
+LOGO_FILE = _find_asset("logo.png")       # логотип ЖСК (если положен рядом)
+LOGO_MARK = _find_asset("logo_mark.png")  # эмблема для плашки
+
+# Картинка-фон вшита прямо в программу (как эмблема), чтобы фон
+# показывался всегда, даже если файл fon.jpg не попал в сборку.
+FON_B64 = """
+/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAYEBAUEBAYFBQUGBgYHCQ4JCQgICRINDQoOFRIWFhUSFBQXGiEcFxgfGRQUHScdHyIj
+JSUlFhwpLCgkKyEkJST/2wBDAQYGBgkICREJCREkGBQYJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQk
+JCQkJCQkJCT/wAARCAbbAyoDASIAAhEBAxEB/8QAHAABAAIDAQEBAAAAAAAAAAAAAAECAwUGBAcI/8QATxAAAgEDAgQDAwgHBQcD
+AwIHAAECAwQRBSEGEjFBE1FhInGBBxQyQnORobEVIzRSwcLRMzVTYpIWJENjcoLhCCWTg/DxF1SiJjdkdbOy/8QAGQEBAQEBAQEA
+AAAAAAAAAAAAAAECAwQF/8QAJREBAQACAwEAAgMBAQEBAQAAAAECEQMhMRJBUQQTMiJhQhRx/9oADAMBAAIRAxEAPwD5QAA8gAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+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
+URjLYEdwME9AICeCeUNIIYaXvGyGMjAUe/cgkjADLwO4AE57jJAAnPkEVezLJgSGOqHQIdyckDoQGWo03XqwpLrJ4K9j36HRlV1C
+lhfWwIV7XoNN2sYVYJyisf8AUi9jpNGi3UjzQfZPsdTeW8YQTcOmEzG7Cm/aa2a2RduNtUsYckfaeWlsz2zqewt98HnoRVKbSy35
+MyuMc5jvklqRrNRpuNPLS95rtHSp0aSlhJzl+Zs9UjGpCU1lYW6PJotp49OnJZ5YtvDLvodNbVeWKUH5ZNppmo+PKcEm4wfLns2c
+/c3HzWnGlSXNWrPkppdc+fwN9pVsrO1hRw5S6t+bfV/ecMnXFr+JOBLXXKjuaEvm1w+sl0l7zQWvyYVVdRjcXkZU19JRW7PolOSe
+M5eNjNFJdst9yTks6b05jVOHbGz4Xu7K2oRiow51tu2tz5JHaKz17n3W9nCvRu6axLFOUXjs8dD4ZWWKtSK7Ta/E6cd2VBKKrcly
+NsrIgcxGQJHMV6gC63HQhbE9QJTGdiMhgOYdiCUgJJKplovm2AJNl1SZkhHCLL3GdmmHwirps9AGx5XkGapHbODC+pZRGMPIJIyU
+RgjIcsbMdQLKQyVWCU0gJ6h7DIbQEAbACY9dzPB7HnMsXsSj2U5Gh46f/sSX/Ph+UjcwZpOOJZ0NfbQ/KRzaw9fPgAaekAAAAAAA
+AAAAAAAAAOl4FeL+4+x/mRzR0nA/7fcfY/zIJl47OT9SjLSZRvY286kn5FWsosyq79gIXTcMPyKy8iiF3yT1GBgCe4zsGsDqBKC6
+AdggNiET1CnQlMhjOAJI7kkZ3AbEPYZ7gAnkLYJDOGBJJUlvPUBhEd9xnzQaAltEdgkMBDqCGT0BtKBHcnsFR3J9xGHkkCc49SOp
+OUAyjKAYwFTlJHVcI6Uq3gVnnmlU8T4LY5GrLlpyfksn2bhLh2EdOtK8amG6KbWPNZM5XRrbyX9Dnt6kM49l4fqa6ndqdrTfXC5W
+15o3WsKVlVdFUKtVvo4xyvicX85radXqW1ahUSbc4YWdm9zON25WabukpVJvOFnuep0lCnnPuPDpt5TuINRnnHXPY9/tSTw8otSN
+Xf06cFKs3soPMfMpptxRoadGq8Qgst4K61CVK2rVFmK5HvnYwaRYzubW3dxNOiknyL6z9R+FbPR4VLq6lf1ko821KL+rHz951FtD
+fLyn13NPRhFKPddvQ2djXhVcuXM4Lbm7fec8m8a2tOWd8JbEXFb5rRqVZP2Us9SkEo7dc7mt1mrKtcWtjFxcasueosfVRz122z2l
+KUbFurHFSqnKePNnxW7XLd3C8q0/zZ98p08QS6o+HcR2/wAz1q7ovZqq5fe8nbjV4EySqaXxJT2OrKc7ggE0aH6EojqFJc3LnfyK
+LY2CQzkZ3IhlkZDGBoSmNh5hdBoSjJS3Zjz95ei0mQegfEjqTjHUkaQ2EyUsdyMMoS3R5pr2j1PB5qj3EZVI6MsVZRHcZHREMaDI
+yCFuxpdJyGxgYBozsTzeZXG4wNGls43J53jqVGMIaRnp1M4NNxpLm0ZfbR/JmzjnPU0/F7/9nSb/AONH8mSxvD1xJBJBl6AAAAAA
+AAAAAAAAAAA6Tgh4v7j7H+ZHNnR8EvF9cfY/zIJl47FlJPBPMVe5t51HLLJ6hREiirZD6eZPVEYAEoj1DeAJBHMG+4E9QRknOwAl
+EYyRloC3fJHqR8QmwJGdhkjv2AZJI+JOMAPUjp1AbADqGEAJXUY9AvQIkEDIE4IyV3y/IlIGkr8A2MDYKh/RfuPdHQ1StoSt6spy
+mubll/A8MujNnb1ZuxoVKbblDOV6BGt3jJxknFrsycm/hZUNThmUcSa2aW6PHW4avaa/V8tVe/D+4M7jV5GTrdI+TDWNVpqo6tvR
+g+/PlnQad8icFU59Q1WdSH+HShj/APiyZucjcjhOGuHLjibUo29OHNbp/rp52ivI+86Zpq0+1p0Kb9mEFGC8klsY9M0Kw0Gj830+
+zjTjnmk0suT82zYSr06UG4vmk10wcM89tSaeH5pWr2zd5ThCpn6nkcVxdpE6kFOjlVaT5oLz9D6HGrTqUvz7ml1zTnXcaifK164J
+hlqsZzcfLvnSpRjXpeyns2b62u4VYQUW8YNTrNp+jbvp+orSzutoy/8AIta/PUcUuVrZLOD1Wbjz70z6/WcLGryxy+V7MjRrlQ06
+lKWEuVfDY1fElaaoVI8zceRvCMmg05XtlRp1ZuFJRXs95fEmul239GpPUc06L5aK2nPz9EbqhNWkI06aXJHZPyNfbqNvSUIRSils
+ltgyxuIx6Zlnrh9zlY3K29K5z02Wd8mttb6leazVrLPsfq44WVjv+J5tW1RWdhOaT8R+zBZ6yfQ2/C+n+Dp9Lnjy1Je1Lzy+pPG5
+dtxSSqUu6R81+VHQpW1xS1WnFeFNctRrs+x9G+aaotWoRpRovT5RfitvEoyxtjzL6xplve2lSzuIxq0qiw4vckum9Pz3Fp75LdTd
+8QcFanol1Udtbzu7Vv2ZU1mUV5NGhkq9N4nbVYvyaO8u0ZMkN9zLZ2F9fVI06NnVefrNYividXpXCVK2xVupKrPryv6Mf6i3SbaH
+TtGr3mJ1M0qP70tmymsW9va30qVvHChFJvzeDqp4nctpJUKH3OXl8Djryu691VqvrKbJKSsRG4yT3NIDIAUyEF1GfQCc7kqXKyqB
+EeqnLYsmeaM3EyxqJ43RNLtmIKeIvMpKslsiaVeckkzzt5eRKbl12IbLpkZXIbYLFG9iM/EYD2KACWO4+JFT1G4GNxQ7ZHVgLyEA
+nsRnsGyoJ7mm4t/uhfax/Jm4yabi3+6V9rH8mStY+uLABh6AAAAAAAAAAAAAAAAA6Lgv9uuPsv5kc6dDwa8Xtf7L+ZBnLx1+dx5l
+ObyHMzbgs35FWCG8FEB+o6jO4DoQ/eRl5AFK1aFCHPUeI+ZanUhVhz05KUfNMThGpBwmk4vZpngp2E7Oq3bycYvflfQDZL3gw0av
+PtJcs+8WZcgO4wSkAIw1gMnJBAAJ6FEFnkglt/cBHXYYJGcAVaBOcEdQGfwJztsQMhBepJGScgBvkdEMhTfuMgYASex01hp6jolC
+q4xzPOfvOYl9F+4624fzbRrGHO0+TOCMZ+PLplyrK8dGq/ZnvH0OjhWprEk1t0Rxl85Onzxb54+0j16XqFW/UKlOnN8vXlXc1Y4v
+oXDOqTo3FepmTpQjlxXTJ29jfQu7eNamtpLucDpVrK20mVWS5Kld7J+p2em2s6NlShhxSSz6nlznbvx26bWVRRhnMVsa+aUYTk05
+Pq2jKqbjj9Xze95IqeNPMFTWMdmYdKy6XRjVgqjlnmWUvIvrFHNs5KMduxg0Nyo1atpU2cHmO/1X0M3ENStC0xBJRfWQPw+XcV05
+3UKlPkcY9pHIWderSrq2qyaqQ3Uu0kd7rEPGUoyzh90clqWlOvLEMxcd1NdmerC9PJl6pqcvHs6vNHZQa/A9miOMdMocsdlFGjnd
+VqVOrbXePEcHySXSax+ZttFbraXSX0cLqjdiVv1zVKPPTbSfQ02majWq6pcUK8WlS6NdEbGyrOnDk3ljzNRrOoc1d2GnJfO6zXiS
+ivoR82YiythTl+ndYp8k82to92ukpH0XTIKFKPLjCOY4c0eNjZQp04xzFZ97OitG4OKzLDfn0OGd76dcG7jN4Xl1PBcym6vZRfdn
+pXTDks9cmpr1neXyp0/ahT3k+2fIw7VerR51jK/geCpplCbblSpv05UbSMVy8rTiQ6bn9R4LMrGdNJV06MfZiopPyWDSapmgo21F
+5rVXyw9PU6y4ahTlLpFLdvscxZUpXV1X1Ov7NKOYUm10j3f3m5ltnTV6xR+YaTUhB8qhFpy82cEnlLPU7bjC/wDG06dKjRkqXMs1
+ZLq89jiNvcdcVkW6oEdQbVIRVMlAT26jp1GR6AM59wy+o6kZXQItkfEhBgTn1IAywaTn0IfvI3CChKI6DsAwBloAT1IGcEZQDfJO
++SM4RjrXVK3WakuVBGVD3HltbypdTco0+WiukpdZM9PVkVI7EZJTAPc0vFv91L7WP5M3WTTcWvOkr7WP5Ml8XH1xYAMvQAAAAAAA
+AAAAAAAAAG/4Q/bK/wBl/MjQG/4P/ba/2X8yLGcvHV9CYvzI77hbG3nXyQ8YK82A2FGPiRkZAldAiGshoCS1PDlytZz0KJDOGmJ1
+R7VY07pclSLj5SXVM8lxb17KWKqcoZ2kupt7Hlqx5ZfRa2fqe10YTSoXGM/Ul5o7WSuP3quZUkycnRVNJtK0PCuM05L6NWC9pe9d
+zWahoF9p0fFUVdW/+LR3x/1Lsc7jY6TOV4B3KxkpdHknJhpIIyicroVE5CymF06jG3UKZHUjo+o6AGOhG6GcASR3GMj1AkjfIxsA
+JYRGQmETlsl7EfEnqFHhJ56Y6n1KnpNC70u1fLGrilHC+B8rqPMX7j6f8nty7jh+lOvUbUJOHMvq77ZMZ+GttlY6XaQShUtaa22y
+jXyox4d1nKoQ+ZXu0dtoT8vzOprypU2lhSk+j8zDqOmUdd0mrbT9ieMwa6xa7o5zNm46RUofPLuwtaUk4r9ZPHZLodMkqeGpPHTB
+wHBmrunqc6N7nx4JUcvs0d1XqKMXUbWUsmcoY16KdWnOckpv2V7S9TIqkZZWV7zVaNXnVt/FmlmtJz+897azy5xnuZ01KxX0/mle
+hdw2UZclTHdPZHs1GKvbCcU9mtjz1qaqUJU5PMZxcdymk1pTt5Ua+VUpPla9O34Ea24fVJTpwahH2o7PJraVONWm008vrk7PXtE8
+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
+6/A7vhjU9P4ti9Zp1o1pJ4jT/wAL4eZ8S1fx6upRsJ1GqFSWGm849xOmapqPyea1G6sqkqtpJ/rKbfszXr6mOTi/T0Y5TJ9c+UpS
+WkRfLiLqrfv2PnO/U7rizXbTibg6y1KzmnCrUzKOd4PbZnCtNGeOajOXqexAyMs6IAjA3IJzlDLIz2IKJ6bkcyIk8SSSy3skurO+
+4a4AVTS6tXUWleXdJ/N6L2dP1fr/AFJvRJtwi95Gdy9WjUoVZ0asHCpTk4yi+qaKMbAdyG+xiq3MKcowy5VJPEYRWZSfkkUZup6t
+NsHql5Cyt5OpdVE+WnFZx6t9kdDwv8l2va/Tjc3s/wBEW0t0pwzVcfc8crPq/D3CmicH0JKxoJVEv1lxPec/e+pyz5JPHXDj/b8/
+a3Y6vwxceFq+mVqFNvEasVzRf3HhjrFpVwqUqlSb6RjTk2/wP1DdfNtRtuS8tKVSE/qVIqSx7jUKx0OzqZs9IsYVY/WhSisfExOW
+tXCR8U0LhXX9WrxlU06pa2rWVUqbOS9Edi/kwoVKNGDu/BUJc1SUfpSXkdddat841GFuto0oc7S6b7HmvdRoWkZVJ1Eo4zJsn9mV
+YskY/m2k6BpbhSUKFGis82N2/eaezsrnXbiF9cQlC3i80aL7/wCaX/33PTpunVuIriN7exlCzg/1NvJfS/zSX8DodZvbXhzQ7rU7
+hfqbam54XV46JE3STb5n8ot5TdehotCS2xVuEuuOy+85hbL0McbqrqVavqdwmq15N1ZRf1eyX4Fz0SajGXqc5I6bErANIE4bISy8
+GSMd9hUTGBpuMY8ujL7aP5M39OGPeaXjVY0RZ/x4flIxtvD1wRABHcAAAAAAAAAAAAAAAAN/wh+2V/sv5kaA3/B/7bX+y/mQTLx1
+beSCSDbzoYJ9zIfoUAupA7gW7klV1J6EonBDzklblZFBtpN9MbnZcIV1R1K4i5SSqxjNLOywkjjJPCeT1cL6ncXN/WqJPw6UfDya
+w7YznT67X5JU3JtN9jktZjVtKstRtouco7VqUf8AiR8/ejzUeIZ17iNtQk5Po2+yNhe0q0Yc0J9Vun3Okmnl328Wnajb1ayaacKm
+8cmzuq1tTUHmOZbZOAu5uwu5uKcaUpczj+5L09DoIUKl5Z0nCpno+Y16ZY6b+raU6lLneEsbYPD8wU04xe76F7JXUl4VZp0l3XU2
+MaDp+0muVE3Yw1ttOboSjV9qdN8r26+p5rqyVb9ZCGJLfpt7jYV4eDqEJL6NxHlbz0aEefx/m8Y+/wBxdtTppq3C1K/tPnNs1Sn5
+ds+TNdX4Q1ihbK5jbOvR7yp74+B3cFQ0y2qTk/Y+kl3bN1wzq9hVtKlejXSprepGWzhg5ZTbvjm+P2mh6nf1FC2sq8pPzjhfifTe
+BuC3oNGd1duNS8qdWltTXkjorLWdL1alKpa3keWn9KMtmvgY1xBYPmpW9eFWS6qLyYdfqPJqcqEoTtrmMatOWzizgdd4RoUnKpZr
+kjJ5WN+X3nS6rczhqEa0uXwqz5ZJvo+x6IQUo4W+dnkJ9Pk9xb1rSp4dWHK/PszFk7/XdAp1KUkk/Dl0l3hL+hwlejK3rSpTacov
+DwRqVQMIZCm43Yz0JKI8zrfkwzPV7iClhOnuvM5LY6z5LU/03cSxsqfUzl4T13lWvV0W7Sm5fNKr9l/uPyfoZ9Yr1Li3hyy9nqz0
+30qdxF0akVOnLZpmgura+sYtW7VzbfuyftRXp5nGJmx0606NTnTfLndGu4ssPnFKlqtrT5qtL+0jHrOHl95eOqW1Sr4U5ulUW3JU
+2ZsbaMnRe8XTkmvgdo4dsfDWqRq287edTmVSLXXrlbSO00y0VGxpJSWUup8duJ1+HtTVCCxSb56L9O8T6dpGv260Cd7WqctKlDnk
+32M8mP5jph21Pyocax4R4eqeDLF5cpwpY6ptfS+B8r+Tnh+VWpLW7+XPc1m3T51vnO8jwahfXvyo8aym5ydlRn7EH0jTT/NneX2o
+2fDtmp7LlXJCGN35JFwxd8rqajZVLKz1PiTRtMuH4calZVZyfRKGG/vP0HLjXStPt4UbeNSrCC5Vyxwlj3n55+Syx4j4t1W/ubLT
+6crrKpq5uH+qtYei6OfofXLv5PLONqqXEPEN1dV2vajafqd/RJ7GM7XXCanbb3nygVa0H4ELel5eNLBy2pfKDdUJuXz+xT8lI8d1
+wLoNCjy2VLUa0o7J3V3KWV8Tk9Y4Ht6tynG3pUoR6vGWznq1cuSRva/yq3K5orV6Uf8AoaeCZ8bXVxbqf+1M4vrso/0OSpcEabby
+lN20JN98HtqaDY06Hhxo0kseRqce3G/yZGynxpcqe3E9b7o/0NPqXF11GSUeIa8svOeWP9DR09GpxupezFxzssC60mCeFSio9eh0
+nDHO/wAr/wAbO344vadb++py98V/Q1mt8YXl3XhcU7qkqsHhyUccy8mYKWm4xzU49dtimo6eqFLnlSik+ux0x4pGLzy+va+NJwpx
+dW2k2l1h0Z4L7i6lexdOnCcJY+sjV1reU481Gr4U/TdP4HmqVasISVzQUm9nKO6O0xY1L20Or3NOprNKrN7J4yby7s6V7ZqElzxl
+HqcprNo6rcqM+aK+rndHu0LXakKcbWv22UmN9utx63GK0ubrQK0rGdWbsass8vbPZm+2lFSTymspnl1OyV7bZUcySya7RtRcJOxq
+vLX0G/yOWWOvG5fqNy/eFsVyT1MokZBGfMQT3Ibws4IcklnodlwBwY9brx1DUIYsY7wi/wDiP+gt0SPTwFwX484avqNL9Wt6NOS/
+FndaZUld6pXupNOnS/VUvTz/ABRsdTlCx0yrKguXw4NRXTtseLRrNUbCkn1mvEl73uzhlltvxyHHnAta6uKmraVGMpy3rUf335r1
+PmNSd5G4+bQ0u+lXb5eRUn19+MH3e+1OpSr1aNLEpL2UvU1Pj6jCfiSu2pJ9EsL3Gsc7pnccFpXyXcT644Tu6lLSrZ/S596mPTsf
+QuHuCuFOFLqEqVKNzqHLvXrPLx5+SK3esX3zd+JVXoltueSlZVJUpValRzqVN5Nv8CXK1fuTx2dzrdtbpc9xFNYxhmlvOJPHuI0m
+0reHtzSe832j8Tlq9JUKdR1nzcvtfAxaTTbpOtP2nUed/Lt+Bn5P7K7C612dei3CDpN4w874NU764i8SnhM8l5cOFKMoSwspMh1c
+5bw/J4EifVYLjUXQ1arKpJL/AHeO+fVnh0unccUaiqs4tadSluv8WS/geCvbz4k1lwtnLwaC8OvJdHj6p3Wh0qNC1UaEVCMPZ8Py
+wXKyRZLa3tlRUFGMEsLZeiOE+W/U/Ds9K0Gm2ne1PGqqPR047NP70fR7WlGKUmt2fJ/lkq06vFulqGG6VpUU/RuUWjHH3XbWo41x
+UUo4xjYFpdSjeD1vOsmT1wVTfxLpfcQTGKZmhHJWEWZ4xwjNotFbGh43WNEX20PyZ0CRoOOP7lX28PykZbxnb5+ACuwAAAAAAAAA
+AAAAAAAb/hD9sr/ZfzI0BvuEP2yv9l/MhGcvHVkroA8I24IexVstlMqwI7AE9yiCyZGM9SV7wAe5ONupD7Ae3RLa3v8AVKdpdR5q
+dSLyjoKGk0dHnOjbwzTT6LqjlrK4dnf29zjPLNRfub3O+lDxZqpHZSSZ24/HDmta6lbUKFZ3MFFy6Huq3UXTy5pP17HhvqM6MnKi
+0qm7a7SNXWv4VqU4yzSqJfRl1+Br1xk2899She3Us7x6NpdTJpF9PRbtWN3va1H+qqvt/lZ47CVVzTk29+jNzeWdC/tPBrRTbWzx
+vF+ZLGt/iuqocjgpLGOxS4qT5JOMW4pY2OP0bVLmwuY6VqUpZ/4VZ9Jx/qdrQfNTXK9uzI55Y6rValCs9PjcOEl4VSM9+uE9z32V
+JKi7jDcqiUvcV1aSnZV6Un1py9exFpcN6XRXNtyY+4sPw0Wt1Lm7qJRrOnFPZeZj0qj4DlzNrmW+H9IzXFJVFNU95Pu3hIwxrxoq
+KcouUV1RYrHc0nb13JKSUltFPGTypVKMvGo1GpxeY4ZnqXTvKbqdZZxueByar+FTz7XVeTJqLNu4s6sdb0aco4VzCOXH/Muh79L/
+AFlrCbl7TWH6tdTS6BRnpc4VG8eJhT9Ta2aVreV7RNpZ56fufX8TllHSXb13EfEpypv2s7b9j59xRo07au7unBuEnip/lZ9DqKUU
+nFtp9TT69qOl6TZVquqT5aFaPJy9XKXbCObth+nzVohe41sbrUr2s1ZWNTwm/ZqVFhYPctIvHFSvdYtLNYy0sNort8Vk6bvb3mKd
+3Qptc9aEfez2Wek8Lwn/AO5cRXd5v9C3g4/kzp9Oq8A2cZW9pwjqeq1ItRVS4i2stZ3bRKswcPPWLCP0rmHwOm4A4w4f0Wd3cX9/
+GnKbUYJRbyvgj2X2tWyVzG0+TfToxoNqTqQWV+Bz97f3Fak2uGtNsU8fRpLOH64E7X5kd9X+VfhFy21CTx0/Vy/oeZfKrwtOSj8/
+kl6wl/Q+WXSqYf6m3TXT2UeRW85Q56tC3x70i/1prGvtttqGj8S0nUtqtK6iuvKsNfxIp6PQptwtLivb43fK85+8+RcH3NTS+KLO
+VFyp068vDnFPaWfM+1+zSk3tzZ2MWWOeeEjnuIdGvrmxa+cQqTpYnFyXtZX9T55xHxtXnp0tEsasnCs8V0s7S7pfE6z5ReMVpltK
+wtp5vKyx7L3ijWcNcB2tvY/ONSzXv7iHPHf2aKfd+bNTtcZMf+q8/Br/AEDZujQo+JqFy1zvtTXbJ0UdCq3epWlrTavNYvqipUud
+ZjTT6vHkYtNsaGjt0oe0+spPrJ+bZ9A+QTSKmucVajxVcpTo2sfmtrndJ7NtfFG71Exv3k+waHpNrwPw3Q0mwx4qhmpU7yl3kzWV
+VzScusn1z3NjrVwvHz0l0eDU1a+Fs8s81d7XnupR8JpPlaOeu72Mm1LCa/E2moXKjTcYtc2M4OTuLnnedkaxjzctRd3UcbyTz0NZ
+Vv0qc4ylntt2K3NSbzmHuNLc1qsZuMVzb7o6zF5q2UKlPmTi9159zBVqxrVHlPbsjxRcp7Tz6YPbbwcY5fXob0zpMaUlOPsey/wM
+l5beLbTg45l2RanVcN28S7C6v4UY5cst/V7lmxztbR5VpKpRk4N9YeRrrzT7ihnKeO7NzUu7h1JVYYhHsl3MbufHp/rGsdzoS2OZ
+q6HKsnKKU8rLfc0lXS1p13yVotUarxzP6r8ztNOUJ5hBuKy8J9zW6zbeLTqUq0cvsxrbthn3pq3Ur6Y1RuU5UZfQqr+JoNco/N7m
+N3byzFvLa7M6/QasNTsKmnXaU6tv7L5urXmafVNFnZKcEnOhLp5xM5dx1wy1WXT7uN7awqxe+N15M9WexzGkXMtLvnRqPNKp38jp
+m/Lp5nHTplNLfkQ2viQ5benvNTc6xP5y6FtBTa6yGkk27fg3hKrxRqDUuaFnQxKtPz3+ij7TZ2VG3pRt6CjClBcsUuyPhXD3yha5
+oth8ztKNnyt80uZJNv1N1p3yicY6g5QtrGym4vpzpM5545V0xkj6trcFO0p2+zdWpFfDO57fCp0Y8smlFLC2Ph+t8bcd1LqhGrpt
+WzhRbbrUaPiYyem2431WMeetxTQzjejd23hS/M5/10sd6+Wc61xHLdSbfwMFaOPovd9jjKHyiUbSVOlfxpOm5cvi0Z80V6tHa0fB
+uqcatOXNCaUlJb5JZY53Fq7qMq17QoZfLHM3/A2Tk400nBrPdHjnz09UqzeFCNNRXvyzKquereOxdppr+IKUpWvLDZzko+9N4Ip2
+U7elBRk3yJJrzI1C7dS9t7fbZuT+B6pVuaL32FtSPNeNunGKXM+ZHgvrm4vK606y2nL+0qL/AIcf6nj1XWa3zlW1slO4k8RXaP8A
+mZvuH9MjYW/6xudap7U6j6tjyNSPbpOn22k2sLelF/dvN+Zu9PsZ/OI16kVTi1jl7v3k2UacUppRcl6Gzg4Ldrr0OVu3bCPUsRXM
+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
+pZquy4M4UfEKrajd5WnW6eNv7SWPyPnsI+Hf3jopcqrTUV6ZN7pHEuvaBplW0067+cafNSTpSWZU215HKRvZUZSVVSjKUsyyYnvb
+tJNdOjtZqpHE4423Z0nBNrC2sq15Orc0ZynLlqQXMmk/I5Cyu4VKM1GpHLjhLPT1OytblabpdCFPnUklidvVc1l9W4mr2zZ02c+I
+762qxULyjUpyTf66LUm/iarU+J5XkZQvdMoV1jDqcsXt8Cb+8jWgoTq2l3Nr2Y1oqnJfmaC6jCD5pUK9vLHWi3KIkc9PdpukcJ6r
+NqtGVrzLCSbW/wATcW89V0CpGGlatC+tIPHg1X7UV5JnNWjc7WpNVrW6lnEYzxGSR5JVI06jblcW788vlJcJWt13i4qc7n/fYztp
+1MJqW6+9bHT2lCrKjzxmnGSymt1jzPldnqdw1GlV8K9oTfLJSfZ+SO34Pv6tPR6ttzScKNWSg5yy1Ft7fA454aTTZ3VlTt69Ktnm
+nKTWc+Zr9e1paXT8Gn7daq+WEFu2zzcS65GzhSxvVzzYz1PBp2k3mpV3qFy3GVTeLa3S9DMn5rL3aBpqtoSvL6cHcVHmTb6e46G3
+1u0pxalW55dPYTf5GsjpFBfT554/fllM99pYUaP9hGEPPlWDOXayvfZatXucq0tW+R7zk8L7jb2EL6tdwld1abgotqEMrf1NNplC
+vS1CUYvnU1l42wdXZ27jWdWeMcuEvI512xr0Xtv42nV6MFvOnJL3tH5zuLrxr6pRlTlTq0JypyjJb7Pqfo6pUUYtbryXmcPxN8n+
+l69eK/jOdtdJb1KfSX/Uu5048tNZdx8uXbcjubHWtEno1fl8eFem3yqce/wNf3yeiPPpCM0NzEjLAUeqn28zNtjc89KXvM+coxWo
+Z6nP8byzoq+2h+UjoMHP8brGir7aH5SDWPrgAAHUAAAAAAAAAAAAAAAAN7wl+2V/sv5kaI3vCX7ZX+y/mQjOXjqk9y2Siyskps24
+LZHYjOxKaAhvz6EIl77hY8gHN2GSPcTkCY+1KMcpZeMs31DgbWbug69ClTnTxlSUlhnPm44f4k1DRavhUpTqWz+nS8l3aLB7dL4f
+1GyquVSrTpKacZKO8mvI38ZKjTjGK7bmG5Xz+lG806q4SqLbO8X6Y7M8UL6dNujdxdKpnHN9V+5naaePO23teupVKnN2PBqVacKK
+h1jJ4we+pUjS3jL13PFqkPHoQqJttPLx5GmY8lmsxbxhZPRcRioxmsbdn3PPaRlGLjJ7Re2xmuk3RSz18i2K9Wn3vK1lrGTaylG5
+hzU5pOO8Wcm26UZRcstLKeTDa69UtJ8snLkfkjFxa1+nr4ksakKn6Z0+D+cQWLinFfTXn7zXadqKqaSpSkqabfNz7Y3Npb8TxnqN
+G1sbed3fVniFCPT3y8kbWvwfomhVFecZ1p3up134lPSNP+jDyzj8TEy+fHomH1P+nMPie0s7duhb3F2oZcpU4PlXrkz6bo/GnyhK
+nHTLCdrYSeHVqbKS9e+DtbPSdU4rqQsYWdvpumNrltLWKT5V+/Jdc+R9ft5WfB+gu4vasIUbWnvhYjFJdjnlnXTDDH8Pktp8ivEW
+j2br3XEVnpFrCHtRt44+Lcl1PnOo6TK91upbWWqanrFvFNS8NYdSWeieMYOq424/veOPAqXtapa6LcXEadC3i+V1Ip/Sk/XyOy0f
+ULLRbSFK1o06dOK9lRWCYy1rPOYxzGg8Bxp0FUXB1vzY9p3tRuT+5mxuKdnoUk775ObK7oLeUrebyl8ZG4uuMJOHsyUTn9S4x8NS
+lVqqMcdWb+HKc1t6dpwrY/JTx1SVO10S0o3K2lbVW41Ivyxnc2mqfIVwNf0OSOjUqD7Spt5/M/NVrqV/qXF9biHTZSpqzzUjOO3O
+1vj4n624J4pocW8NWmqUpJupBKovKa6r7zjlLHql6fH+JfkD0Xhe0uNYoKreWdCKnWtpNpxgt24474OA4jnwlZ6ho9PTNLhKCmq9
+eU3LlcGvovf1R+k/lR1elovAGsXNacY81CVOPN0cpJpL7z8nTu6ep0XWgn7NOEU/P2Vn8TWGP0mWXzNvtXDt3wFqV3SsbDhrTKd6
+17TryfLn033O1XDV4lFWlpw9bw8lQba+9H5Zs7mdtrGnVoSlCVO5ptNe8/WOmamnRhOc0lyJ5z6HPlwuN6ax5dzdWjw1qlSlha2r
+R/8A9rRgvzieG74du7eP6/iPUa/nzRgvyRa9+UvQLFypyvIzmuqjuaG8+UKx1XNC1n+sl3fZGZhkzlyxg1HSbL2lO4uq0vWf9DSw
+4esOZynRnPO/tVJf1Nvb8ry1Lmb3eTLKKaxhpdjpJpwvJa1dGzs7VN07enHl+s1n8zT6zr0fCnUbcKVNYUV3NjrFapvShsksy9Th
+ddrq4u6FhFpJyU6mfJHbCbccrvpsqN0tL0qd5XklVqfrJcz7vsfOdb1a41e4lCLkozfTt7zecRanLUJVIT2srfHiSj3l2iviebRt
+MpuLq18RnU3S8l2R09um8cfifVaaw09wfLGPN/E91ppVa4rJOON98nRU6NtbTlOOG/LyNlSpwpU6dRRTUt2a8Yy5LXOPRXCo44zs
+eSro04VcPLijsV4bl0377nivnHlbjjIlY+60MLVQ2axjqyymoNrnys4we3EZJ5jhdzXXFxZ0d5V6aflku2puskozlupPDMTnODe2
+UjzPX7Gnn25y9yPNU4htJPaFRpGdxuYZNjC8qN4lBpdsHnqV7ht8tJ47HiXEFPHs0m8ebKvXctN08d+pNtTCvTOd637MEjFOje1H
+lyikUWu0+kotP0MlHWKD2lKUU/QNaseeVndrKlVeH5HotrKK3k9u+T30rq2r4VOrFt+pkqWvPF8jSLNM21DoWtCKliOClS9UUlTp
+ZXmYoW05PE1uXdrWh16eTNMpV3CTaqU3FfgYpwuNMuaWq6ZWdC6oyUoyg+pM6dSUFlJN9j0/M69rTzjmTW6JZK1jlqu0ld2fEui/
+7R6dThSrxfLqFtH6s/38eTOa1CfiLxYbyp+2sfWXkeHh3Wf9lNejXliWn3q8C7g+nK9s/DLN3xFpq0q/q0INulOKqW81upU5LKw/
+c0c57prPH/6jw07W2rxVWmuVy3Tj1PTHT414Knd21G9p/wCZYn+GDTaXcu3m6UnmLk8LyZu4XDhKNSL3XVPyLpzuWWLX1+FdFq7w
+ld6ZUbwlJc0X92TDPgrXLWMpabqFG6S3UKc8Sx7mdLSu1OUU3mJsIada1Z+I6MYVMbSjtJfExY1Oe/l86ub3iGwqOnfadUnt9am3
++KMNLWqG8Zqpbz74f8GfU6dDULam42l7NvyuV4q/ErXpadcxf6a4cta6a9qvbpRm/XCJ26Tlxr51K7pV4YTo1ljbHsyMdOe/LmdL
+HRSXMjtZcBcF65Tm9Nvb7T630nC4z7HvR5a/yOcX2kFV0itbapbS3Uoz6r3D706fMvjQWUYRu6dSdJPD5ueD9nbzOp0e4jpmhOtX
+lyyqVp1PRxbeDlb+hcaAq9vrOn3enXNSMoQ5oNU5PHU9+j0rjiO3tLaajC3oxUXySynjbJnK7Yymo9lhbXOvXrvriDdHmxCLO1oe
+zBRlBx5VhEWmn0raEYR9mKWySNpZ28q840cZnUeInHLLbl7XlXKs8zy8Hqp1KcIJ8rTXodHHSbfT6KagpVX9KTWWa7ULujbU3VnG
+KS74MTtvWmHSbujbUZ3Nw3CrUe0Wt0vI21jqtteVXTp8yljOH3OL/SjrVJXFeS5ZfRT7L3GJa6rC7p1acnKWfZglly9Df9X5Z/s7
+fQ7m6p29CVe4kqcYrPMzmbm7r6snKKnb2PVp7Sq/+D1WdhdaxON7qzXIt6VtH6MfV+bNL8oOs/o2g7a1lyykuX/pbM4zt0tcTxNq
+Kv8AVKkaW1Cj7MEapkevck9MmmEovDbYpnYmLA9FKTXc9MZbHjhJZM8ZrBLCPRk5/jf+5F9vD8pG/jJM0PHDX6DX28Pykc3TH18+
+ABp1AAAAAAAAAAAAAAAADfcI/tlb7L+ZGhN9wl+2V/sv5kEy8dR0CJXuCRt5jPwJQHQKP0I77AZx3AnYPqVzklsBsZbe5nZ14V6W
+OaLzh9GvIw9CX5iG30fhq5sLy3m7fEYT9qUP3Jd0ZdSsKfhZlFTi9lnqjgNA1KWm6jRk5NU5zUZ79n3PqH+yWo381XpalDwpLmhT
+nDOF7zrjXm5MO9xxF3plza/rLeUnH/Dl0PN8/Tpuly8k3s4yO3v9Kr6fSlUupQUY7Zz+RxOpUpV5PnorL3T8kdce3L/+oo5T5pdO
+68jNNKSUY758+xqKNpeUZyVKtKWN8TWTNO6ubd5uLaWMbShv+Bauv09VxZQkk022uqOZ1zUWqy0/T6ancS2k19U9mtcTRsbGXhzc
+q8top7OI4Q0xUaSv7pKdxXeVzdUjGV/Dvx46n1Wy4WtK3C29ty1NWuY5c5bukvM7bQ9LjSrKpJO6vbhrnqzeZN/wRz+mUY+NdV8x
+lX5+j68vZe47fg2Mamq06kuyyjnemcs7lX0fh/SKWl2sVypTlu5JHBf+oX57/sS5W81CiqydfrlwPpttUUoryR49e0Gz4i02402+
+pxqUK8HFxa6ep5re3s450/OlCw07iLh2jaqfPQUVy1Fs4P0NRc2/FuhUlC3cL+2isKpOWHFdFnLRv9e+THi75Pa056TSnrGluWYw
+pr2459DntZ4l1CvpleyvtBvaDqRw8xezOsylW415ritxjNQVaxpW8ZdJuax+ZqtSsHCtT/TepSXiPZU+h7aXGeNJjp8tNq3tedGN
+N+It6bj3W3U1EeHuJtfrxpW+lXs4zfspwbUfj5GvqaJj/wCNtq2tUeHrKna6b4a5lvF915s+1/8Apus7224Surq6dRUbmv4lKEtl
+Fd8HzzRPkn0nQVS1PjnWrejy4krPnWZPyb/geniz5Zbm/t46LwdRlY2UF4cq+OV46bLsc8rcr011PWx/9RXyhU9Xr0uFNOqKpTpy
+U7mSe3MnsvgfO9PtoQsuWK35dzU1KE1X5qvNUqSfNKpJ5cpPu2bm2n+ocG8NI9HHh8x5+XPfjQXNWa55ReHDdNdmj6TW42vLvRLW
+2p1HBqnFbPeTxjc+cXUHy1MrHU9unXEqdGnmTaylu+iL8y3tL/l09tptStceJUXiVu6fY2tXS5UsVHDkcN1OGU0dRwBo9vqV9N1+
+WSg/o/vHb8U6BYVNMnKnRp05wjlNLByyz1dH9d1txXDeqK7puE2nUjs35rzNxeXULSm84cmvZT6nz7T7ypaajUjRlyr0N67mddKc
+25SfdvoLi5XLSt5c+zUq1JYe7eT5/eV69epUq0E6lze1PCoQX/36HScQXjlFW1OXM6j5X7jy8P0lSqX+vOg50NOpeBaxSzz1Xj2l
+6rc1/mN8U3d15aWhQrapT0OlJSsbH27qoutWv3z9yOwp8GWFSpCrmTws42wefQdDnpWnqlVbqVp+3VqPrKT65Nra1qtv7M1JRfQx
+KcuW7pjnwzp+VF0ksd/M8d/oMo03O2eIx6RPRrPFOnaNRxWrqdZ/QoweZSfuNVY8OcefKByyp0Z6Hps9vEnlTfr2Jc9emHFcmg1X
+VbPSpuN1XjGp2it2/uPDQXEnEXLHRNFrVIN48Sa5c/efb+FPkM4e0WMa+pRWq3nWVa4WY588M6e6vdF0qPze25Zzht4VtHma+CM3
+lv4ejHhxj4VZ/InxDqMebWb90E9/Dpdja2XyEaXR/aatzcS6tzax+B9KvOJLutGapWtCxpJbVrmok/8ASzjtV4v063543vEs7l5x
+y2S8Nr7mZ3lWrqeNXP5MNB01SXzWmml1lL/yam54e0ehJRpq1Uv+pM99TjrhWD5Z2uoXr868nJM8VbjnhbLnb8MWWenNOCz+RuSu
+d288NJ0+lJqUaHL12SZiuLfTk8SVBt9NkkZqvHWm1cxp6VY0l6JGulrFjdTlzULNp/5VsdJHK7UraXp1TZUaMs+TR4avDOn1k34P
+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
+FTjjHjTWZP3djxS4Lur6t419cTbfm/8A7R39vplK2ioU6SS7JI9L0W6rU3yUWvfsax25XK1wttwpp9oo/qoyktsy7mS40q1gvZhC
+L9EdPW0a5pL9dSlt5GrureEE+dqGN8yZ0xz055Y2uO1G2UMvlXKt8mmqwoV/qrywdjdWVW6bjTinGW3M+hqafDHzaq6laXO+y6I9
+vHyvHycd24+90i3eW4Qbb8jQ6joFo3zRi4SfePY+l3On0N4ulF5Xkc7qGnUov2VhP8D1Y8krn3Hz26024tt6NTxV+6+p4FcPn5ak
+XGXdM7i40uLajy59V2NXe6G5xeyqLya3R0laxzaOF1tyTjz03t6r3M6zhnju40lwoX05XOn5SVX69H3+hx1za1LN5WZU12xujHTr
+8r5ovD8uzLqV16r9B217QvKCr29SNSlNZjJdMGu1XRqOoQdSlFKrjpjZnyfhvjG54cuU4c1Wzm0qlBy2p+qPsmmanb6lQp3FvKM6
+c1lYMeOOeGnz6NDUOEdUjrWkqXPTf+8Wz6VY99vvOr17R9I4y0OHE2htSjNYubeKxKlLvt7zb6npVK+i5RShUS/1HE2d1X4A4g/S
+lKnOWnXT8K8tl9Df62P/AL6llSXfVaOzuHa1ZWtV5a+i33R57O+XDWuTWF8zv/Zk+0ZeZ0vyi8Ows6kNT032rStipTnDos9jlqtC
+Os6bKlt4iXsyf1ZFsbxv4rBxhNOdrcxX0KuW15Hqtasad7Cs9o1Ipv4mjq3M7vS52dy/19s+V56tHrsVVvdLozU1Fw9n7jXH6cuP
+/Lu9HuqKqSpSeM9Db1K0VDlXU+bQp3/iU3G6cM/WXY3HzLVJ4T1l465x/wCRyTt5PiO0pNyj0i8dPUpO7jCLUU+fphb7nO0uF9Wu
+YZ/TVVN7rb/yey34E1apWpt6/UpyW+eV/wBTn4skdfpU6ekWNTWtVmqFKkm4wbWZvthHi4f028u9C1viC7pTp3OqPMKcusaa+j+G
+D2cP8A28a8a+rarX1VwxKFGtJuEWuj5WdVqtVStqkIqMYKDWOxzt7d8dSdOLu48+k06i5W/Bms/9uDyf+nRtUOIYOUvZuoJLstmZ
+JvGiQlHdxg9l0ZznyM3t5bVtdVtU5E7lSaxnPUnJNzTrwZa7fohZcUsZPHTs/mkZQ55VHOTlmXbPY1dHiydKhFVLNymlu1LqbC21
+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
+dK1ydHkleu4hHeLazJHg0G41ajUqRnS8dw+kl9LHuNRiz8voE6icOuVjofNeLX4nGelwjLCUXJ/idNS4nt01Rrc9GrnGJrBynEdW
+FTjKwqJ5iqTeV7zGfjpweuwtajUYxazjvk99CsqkvD5ZKWOnZo0VC9pyptQeX2wb3T1yxjKftNrqzloy9bTStOra1Unb0pqnFLln
+PvFf1PpGn6fTs7KlbU3tTjhPz9TkeD5QhXuUo7vDb8ztqE4tKK388HDkrvxzorUVKny82Gu5T5jSvrWpGrTTU4uL267YPbLl5fo5
+L2cJeFJbLc5b066fE73hdadWqWM4yp+FLEHJfSj2eTX0uE3qtw6FGnKrSi81Z42S8l5s+73umWl9FRuaFOrFfvxyeKrZ0LS3lCjR
+hTh2jFYR0nJXK8Pe35k1/RHDUXapOHhy5pwa6Gp1O3UIbdu/kfXflG0ahCdLUKMowuZ4hKL+uj5frOn160vZXLBbyWep6sMtxz8u
+nK3O9DOMbmKL2aXQ9Workg1Fd+54nJxSS6st9enCdMyk1tnCPTCeH6YPDF4W6yz10IzmlSS3fSRqM5RsbaSjs37PqbLRrCdavKu4
+vk6RJ0rSqdWEHU3l3ydNZ26h7KWF2aGVebLJWNmoUJVJx2jFvGOhzPGFjRdPSdMowTubmp4kn6N9Dt7rKtOWTSc2obd87HL6fT/T
+vyjwjJc1LT4JRx0ylg4ZXpv+PN5O0u5LQOGfDopQlCkqVJLvJrC/E0PGVxHR+G9N0CjHllODubj3vdp/FnQ65Sp32raZprjzU/EV
+aX/Zho4DjXU/0jrV3UU3jmVKHolt/A58fde3JztpRko+JPrVln4HRUqcY0oxSbz5HghSU5R5VhR2SOj0+zdCMq1WDdOjB1JPyPZe
+o8Of/Vai8sPn+sWXDcU2p4r3LXl+7+B9i0SFKhQXN+qtrWCUfcuh8y+TW0nqNa+1+4T8W5qunHP1V6fedxrF7Kl8206i0nVfNL1X
+kfG/l53LL5fV4MfjHbo9It567qLvK0f1aeUvJdkd9ZQilHGF5YOZ0C2+aWFOGMTayzpdKg1cQU+nU4amMLfqussqao0klvKXU9ka
+2ZeDRe6+k/I1juVSikn7Utke+zjChT55bJbyky/2adJi2FOnCjTy9l3b7mvv7mpUjyU1yxx26kK/+dSytoLZI9MaHiryRjLK59Rq
+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
+l9MIvwKvFq17mWXzS9l+8+VcbcrX088tTT6bbVlCMVJ9MG88Rp05xeFhHK+LJUs9vM2dLVYfo+U20pwjjDZy5Z0cV7dLaairmtzZ
+yoPlXvPdqWqZcLOEui5p/wBDmtHrQtbVVpNexF1JZNZp3EEby4q1ZvDnN7t9ux4+3smnfaZcc00pbN/ibe51elbzVtTalVa3/wAp
+xFHXYWVCtd1JexRg2nnv2NHpPFMnUlcVZupUqy5ll+fYuGdxXLDb6jG2d37cur3bfY47i+1ocs4UoyrVEvqmwo8Uwu6kLCjUw0l4
+0k+77Huv5W0KSo06SqVGt4rt7zvlZYxJdvzlxNb3dCrJypRisvqfN9ajV8Vyezbznsff/lB0iq7WpUkqKx9VQyfCNbqKNWcKtL2e
+mYPGPge7+Lenl5uq5mvUc3yyeGt011M9pdRvsWl4/wBb0pVv4Mx3Ns4pPPNTl9Ga7PyMEaLl7LXK10fkz6Ujy2r17SVCu6dRcri8
+MijXqadcwuKX0oPdea8jbzitU02FxL+3o+xU9fU19a3bh0TLtnbf67YLVdMjfUMNNZ28jdcE3UdQ0rwJP26HstP8Dx/J5/vmk3Fn
+W9rwqjW/l5E8NQ/RXFNaya5adbOPV52M7c88enR1KWE4vyccM5jX7J3OlVYpe3Sy1g7m4tlu1nY0V1aLnuIrDU4/jgsrjjdV8z0W
+pyahBNdWmd3oDlp3Gbim1Sv7fmx/mWEcPY0sazClvzKbizueKberpVXQdRy4YqqDa269hk9fsfQXbOrR587pdGc3qF5KlXoXai4O
+xrKpn8P4nQWleU80JtvKypfwNFxDSjRoVqEW5KSzt7zMeedV5PlZoYvLW+S2qNPKOXv4O70erTT6xZ2PHyjqPB+n3iypeHGZx9jF
+1rHOU3KHR+43+GvKz8FS4ruuHpR0biGVrToVJQVvPHLhLtsbe11q8u7SpYcaaZbapYx+nc0livR8peq9xxfCVzcU6tegqkoxi28J
+m+vlccrrUKkoVKazFrqZ+I6Xlsumo4l4cr8D3dG6s6/z/Qb32qFdb7fuvyaN3wrrtK1rQpOTdvX+i32fkbPhW4hxpomp8P1qFOnS
+nSdWlBPenVjvheS2R870uVWlTubObaqW82l70XC/hebCWbj7P+rnlrDX5nnuKUpU34eV6M47TOLLq3t6EZ0fFgsRlLO6R3EKiqUY
+1YvKlHKQuPbw2arS6PcNUdQhJ5fjy6e4+e8N30bPietVbaWaieN/rH0LTqeLW4r42qzlNNHCcC04VeMbiM4qSxUymv8AMHo4/wDN
+fU7W6tbigpqrT33xzEyq0vEynF+TyeSWjafnKt4rL6xWDVaxbULaLoWqqSuJ7qKntH1fkjLlJtub3XbbTklJ+JUl9CnHdtnOarr1
+atV/XNPyoxfsx9/qa2pdK0TpUJKdZ7VLjv7l5I8XV5fVkdscdLTk5zc5JZfkR0JyQw0htjL7jsQwJ2DKjLQFiOpHMObcCTUcTf3b
+/wDUj+TNtk1PE392r7WP8SXxcfXKEEkGXoAAAAAAAAAAAAAAAADecK/tdb7P+KNGbvhX9rrfZ/xQTLx0uSUAbcD0HQAAMkEoBgEk
+e4AAEESslZLLyWDCun4e4nhGirDUXJw+pX7x9H6G/qzlGC8KanB780d0z5w2z2WOt3mlpQpT5qLeXTl0+HkbmWnLPj347HUKUbi1
+mpppY5sLzOMqyi+K7KbSw6TWX7zrNP1W31WjzU5YmlhwfVHH3040+JrOEk1yZRb3E4pZdV9Bt61KMElHZIzqNOtHDit+xrrKcasM
+PZHsprDUo7voYYynb1cNxWn8RU+ao/DkmlDyZ9MjOPKmpbnzPTKTr3887YhtLHR9jsNIv5VqKjUeJw9mWTGc23hlp0DnGMfZnv5M
+11zxTGxXzS2SqVvrSfSB5tS1NWFpUuJOOIx29WczRqTlS8TEVKo+f35MY4bMuTTew4i1SFxCrO48WCXtU8LDXobH9O22qxxQk41I
+9ab6o5KFdOcYKL8yjvFYXkLxLPhvEmlvy+Ru4MY8l/LW/KS6ivdPbmklzv44OF1q5daCg4rL2O+48lSvp2DjPaXM1nusHAaxCMKs
+Iyg+XGUzph4t9crq0HG3fM/uNZn2DbatHmtJNLOH37GnW8Ukavr1cf8Al6KGIxis9TobKErh0qKazLZ+40NOH0Ul3R0miOFOpKtJ
+Zx7KNRz5a6BUvAp4aSWPwNbd1XT9qPVdjLWup3LcYvZeRVUmorminJ9Wxp5Z/wCtZrd5OWl1WpbuGGdfwbmlw3avm2VNvBxeu0HS
+sbh4wnE7LhaaXDtul/h/fscOWPbw3WLLGqlw1d87X6ypnBx1pTjPVazSWyil9x0UnOWjVIpdJ9X7zT6ZSb1K4fLvhY29DfHOmeTJ
+3tkuWxpQT25Uc3qk4VuNNPjJpqjBzXvOh0ybnapbeysNHJamnT4zp1OmaDS+8xlNufD/AKe3Ur5W2kXdVP6S5fvN9wHXitJo59nb
+dnCatcuej16eF1i2/idTwXVVXSKT5n0xscP6+nr5M/y+mUbiModco1nEuoqwtISTw6lRR2PDaXTpLw+Z582a/jSvKemUJLlahWi/
+U4ZcSYcjsb/XPm3CtzUb5ZOkoJ+/Y5HR9YVNQ9tN4WdxxJf8/CFVJt4jF4OCttRj4dOUKjUsbrocv/z7emc2n0/iHijweH50VU9q
+tUS+CaNJpvEShvzv2N0/I4XXtVnWsKTU5PkqtPPwMWnatinOMp+y1jJrH+J01l/IfTOH+M/m9Z3c6jbnzTlv1fY+kaBxnS/R6r1q
+sfErPPM35n5olqjoWFtVj9GMnCZvrnX5VLO3nSnJQUUsGr/D3enK/wAmyPrvHt/Tq6bOca6nKXZM+H3ltK4nUi475ybSlrU7qnGn
+Kc5LphvJ1+gcJ/pihzcnbo0emYY8OLzfeXJXyq2sUrp2kl7FZbekvMrU0yVLKccyi8M+h6/wfPS7+3cY4XixSz7zX63pvh3dSMVh
+N7lx55fG8uOuV0O05ry7tmtqlLmS9dzz1LKotuXeLaZ0fD9lJ8Q4xsqTbPZLTIylU2xmTx6jLmkJx2td8nUFDVr626+xGePezNrt
+N2XGWmVEklVrpP7mbTgrSvB4o1Cai+T5vBZx3yxxfZc/FGgxSy5XcY+/ZmZy7yay4+nTXVDy6M09e2xX6NNxZ193p/tpvouiNVdW
+qVVdtjpM5XlvHqvjFOhGjxk44yvnD2PoPyp06VPhHTpt4krunyv4M5epZxlxtThsm7iTex2Hyz0FT4M03lS/bqaXrszra74Rs0sW
+9OpCWJKKzj3GivoyqKtOcmnyvPqd7pvD/wCppzlh0p0lmPdPBzHFFgrGrKlKqnJwk45W2ME3289x7ae/qu4+TDTsvP8Auy9p+9nO
+aLiNjSz0Ueq9x1bjCHyV6VmKbnbPp8TldMX+4x5Vty43Ok8XL1pNAjH9JXjWV7R0mXUjJPdYwc/w3HN9duSX0vI6Gp7H0cZ7mp45
+8n+lvk/rUdL40nVUpRlGUfZWMNSeDm+ILOGn8d6vb0v7OU5TX/c8nr4drwnxdWc880eTla7NM8euXKvOMdSuc5WMfE5z/T1//DLp
+qc7ZwytnsztdL1JLSHUnJNxi4tfgcdpij82py7PfJtrBuvRurWEX+scUjrfHiy9dfb2PgaPThHP9m2/Q+a8D052/GlTnxiaqYz/1
+H2G5t1CxnFJLlpY/A+P6lc/oDXrG4pwlKbhUbjFdXzHG16OLHqvoesanTsqfh00qlxP2YQX5+44+9vZJTo05uUpP9bUz9J+S9DXU
+ru9r16l1c1P1tVY5V9SPki67ESY6Qo4WCyJ7sjYNJyVxkl7sgCAS9h0Ar0GCX1GAISGCUw1tgCDVcTL/ANsX2kfyZtcGq4m/u1fa
+R/iSrj65IAGXcAAAAAAAAAAAAAAAAN5wp+2Vvs/4o0ZveE/2yt9l/MixMvHSYSZPQmeSOxp5xkMZICnqSiudiQic/AhgMKE9CMBg
+TsTnuUyWXQCSrLP1KvqA5qlKEp0pyhUSzFp9zUT1ite6rZ1K0Uq8JYlJdJG3OcuMQ1ek9kucu3TDGV9U06o6lFSz7RsqdX6rePI0
+WiVoqhlPubqNVKCe2fMunjz9e7Rqqd/WeZc6ijc2d47fVYJyXLV9lr1NBoE27q5m8Y2WTZq4g9QoRaTaln8DNjO261yq1pd3yJSf
+hS+l7jR2FeorWjlZzBZ+42d7XjK3rKo+WLg119DTW1RU6CaksY2ec7Fk0mVZ/EcKspeIlzbYZkfJOLT+ts0a6N3FylJ8kot4RlVz
+mOz3zjAY01+qafTp3VGrFylJ7bvKS9DnOI3BV4RT3UWdRqc04U5NuLTTOS1qLq6jvjChnY1i3je3LalDltKrzhdfeaS3fNNbZ2Oj
+1W3cLGsl7WE8P0OdslsmL69nHf8Al74R9h5W/Y2trSlSlCnvjCbZrqTWy9Udbb2UJ2VWs19Bx3+BuXTnyVNrGKisxy2ehLEcdzBG
+Ph5SeEXhVlCGZSznoK8teLiKh4mnV+b2WoNo2PCt1Gtw/bPm6QxsYbujK7pzhu+em0k/ceLguvGOmTtsrmoVXFx+Jzzerhv/AC29
+GWdMuYZb5Zs1On1o09VScmuaGcm4skmr63ljm3mkc1Vfg6jbz268hcUzm30HRqmYVFF4fX3nMcURdDW7C47VJOm2+2zZvuH6jnUl
+Ta+lHZmk47oSlp85QUvEtaiqJry6fxJ+XPj6yc7Vrqpb1qbW/KdLwReqGk8qe8Xujlbh4upvZKouZL0Zn4S1B21a4ovpJ5Gno5Ju
+PpVrqcKybptNp4eSOJakrjQqrjtOHtKKOcttQjQrZilySe7RvZVoVqE6ez5otNehzyw0445aeCnd1NV0Gpb8yzKk0mvccBRr1KKd
+N9YZi8+mx02hXTtLmtbTX0JtJehoOJbOdjqs5Rz4Vd80fJPyLjjp2mTE/EvrSvQX0tpxXu6mvt7mUY42TTPfbOdKUanSR5NRt/Dq
+O4orFOW8kvqs3JpZkz0rhKM7erJKFbeL/dZ6bevVtf1FXdLpnozT0a2U1KPMvU2NC9UY8lSKqQXRPqi60ldPoc6HOpzjvnOD6fwp
+xBR0+SnUqRguyPjNtf21J86hVjjtk3+l6+5zhCFsnj6098Hl58PqNcd1X1XVNQjrt3G8dLktaOeTK3qSOcvbGdSdSvNd84fc2PD9
+aVzVg7ueV5dkby60uWt3UbWjT5IL6TXSEfNny7n83T6OGH13XKcK6JKMb/VqsMRqLwaS80u6+89kNJhyOfL7XXDR1WoW9G3pUrC2
+XLRorlWO54r+3qwoQtremqtxWahCK6tsxea2u04ms4R0vlt9R1FxcYyqulBtdUt8mqoWD1Xj7TklJxtISuHLsmnhL8T6NrVtQ4f4
+dp2UX7NKC5n692c/8nGhVVR1HX66cne1OW3g1vGEdn9+Mnp4bu7ceWSR6byTd1KHKtjT39CTnzRwtnk3dWHNcVqi2fM18DR6tfRp
+0K00v7NPMjvK8Vm3zrSLR3fGMppc0ac3LPvN38sFbxbfQNMz/aXUZ477ZRm4G051burcpNycse81nF0nrnyoW2n8jlDTaKlLP0eZ
+4Z65drrU2+s2XK7anFN/RW/wNNxlYxraVUr8kc0Yt5a3NnoslWsaSbXND2ZY7M8fG9WMNDqW0ZPxLlqlDHnn/wAE/Lj64vXrf9F/
+JzpVs8JRtsb9e5xtlJQ06M878mfwO3+W6orPR9NsafsuUowwvgcFqeLDRKk/8OnjPqd54zZ21XCa8apc1s9ZP8zf6nXoWlrKtUmo
+pR39TidH1mrptBxhbyk5tvmR7KsbzXq0FWhKnRW/L5+81+Ey495bevhPwaU7rWrltSWZRTe2OxrLOTqQurt55rmo2vc2W1e5TUdK
+tEkv+JKPl5GbTqSqXNOjD+zo4cvUzjO3XO6jexto0ranTWfZj1PTw1Hxdft6eXvNN/AlUalekpZ2aMvDFGVLia05+XHQ6Xx5J3X0
+y8i5W1ZY28OX5HxzXoRqa1bSX1acl+KPtN1HFtVSePYl+R8b1yHLqlDPeE/zPO9XH1GBLJZbEJ7BvbqVlbIbRXIyBOSCG0M7BEj8
+SOZEp5Coe4yH1AD3dQCeoFUarib+7F9pH8mbY1PE392r7SP5MlXH1yZBJBl3AAAAAAAAAAAAAAAADe8JvF5W+z/mRojecKLN5W+z
+/mRYmXjqcplXuMbkYZp51WiMF8IrPYGjGxGRjuT8AqvxGWW5SMAMj4E4GAiEWXvIHxCpIYwQ8AG8I0VWirjW6NPs5bm6qTjClKUn
+hJZbNVYVqdbXaNSHtRT2YdcPK77TKFO2t1FR6LLPdz8sHyy6r6JraNXlpuS6PueStrMYqXKnN4xlbYOsjxZd10vDk5yp16jkn+sa
+x5ntUKtTUY1fF5Iwj2NfwvlaTGq3vOTk2ke+NWnGpOTlh+8jF9erU7VVtOqp1Jyag2nnuau1UlaQTqY9hbGe5vpUrepmo+VxeH5G
+ot9RqeA4ypubw2mhIzWahWjH2W23nJsaNaM8PKf7xoKEp1aXPJb9UbO2lKMc4698izQvxBUlG3jKNRdVt5nN3ck7tuWc8qZt9eqL
+5m0sprr3OfVZTqZmm5YXcsbxjyavFxsa/f2XjBzFmmqMc9+p1Os+zptfGza3Obt4vkhFeS2J+Xp4/wDL2W8Myjv1ksfefS+H7L53
+pF7DCecYb9x86tKUpTpJ9PEj+Z9W4Kpqpb3MG93NLC6dBl055uWvqag4yjlTezWCLK2denmUW5Z+4319Yuhe1qE4prLcX6EUbb5t
+H2d0t2mNuFKFnGPL4iTwzhtMpvTOJdT0/KjzvxIt+p3tOq6kk87o4rjalLTtdsdVi8Qk+SeO79TOXjvwXvTaUJ/N9Wptv2a8OV/D
+/wDJo9ZpOlVqcq9qnLmR77+o/ChWpvKpSUk0/qmTVacKypXMFmNWG4jdbXQL2Lnb1ub2ZpfibvW7GF3RmpRTjUg4M4fQrjEJ0HhO
+jL2V5I+hWNSN3ZQk921houTheq+PThUo28VVWKlrJ282u6XR/ieS3rStrxVFtGTw/cdbxpozsdQlUi8W91Hddo1Fun8dkclyc0ZR
+fVbP3oseqXcdHQuJKHhN+sX5o3mjaiqlPwajxKPSXmjjLW5da3j1VSl19UbayqeJyzg8d+vc1e44ZY6e3X4Kwvaeo0k+SXs1P6k3
+9vT1/TlGMv10fahLyZ65yp31tKjWjnmWGc9bV6ui3btarapyfsS815GNLK19OtLm8KtFwqweJRfYzxqP2uWKcXs4vubXV9Ip6zSV
+3aNU7qK2l2l6M5r53Vt6vg3UHRqrbDXUu3TW+4z1NOU5OdnNJ9XSl/A8jlOhNwrUpxfXOD3RnGeH3fc9VCvWiuVTjUiu01kLMv21
+1O8hlcrfrsdBpF1zzjGnCcm+yizzKtiSatrbL/yo3mk3tSnH6fhr/IsHDl3pvCzbueGba7ajWu5xs6C+k5tcz9yR2ttr9tQou2sI
+uNP61R/Skz5hbXkaji5SlN+rzk3VtqVOzipV2ln6MV1Z8Xmwu31OHJ2dW7o0acru5lywiso3nB1n4ievXlNwc042tOS3jH95+r6m
+j4d0Crrjp6hrNN0bOm1Ojby2c/JyX8DacUcUw0yEba3j411Wap0Lemt236eRxwwu3oyykjw8Vxr8U6pR4etMudy81prpCl3z70dL
+qsqOg6XQ0zT4xSpQVKGeqwupl4N4a/2W0utd6hVVXV71+JWqSeeRfurySNDq1xG4up1otqKbSeerPpYYfGL53NyfVeG6mqNB5+m1
+j3nF8RXCjSdpSeZS3l6+h0moXLpUnVm8PHsr+JzdpY1NUv4ycc5ls2dMJuuM7b3hW1paZpM7mriNOjTc5N+SWTheEqFfU7/UeIKy
+Td9XkoZ68kW0vwwdX8pV+9N0a14bsv2zU34T5eqp/Wf3NnmsLOnp9tb2VPEadCCjld8I9WE/LHNlqadLw6qj8ZpxVNSw13ya7XKb
+1rjLQtJpTxGjP53WXZwjth/ej3cNxmtNubrPsyqyw/TCNbwHc1L2vr/FN3iFvBuhayfZR2l+KE9YwnTj/lcvP0txra2NOSlTtMzl
+H39PyOH4+uXR0ynRi8OpPdehurXxdW17U9YrVHP5xWapy7KC6YOP43uPneswtIvakt8nVJ/p5rDVbehbQg7edSUVhYR6nX1TUVy0
+oq1p9HJ7bHnta/zWLeFt0NjZ2Fzq+HVrShTfZdzejLPTxwtqdKXzazzVrz2lUN5YaXGxpxi1mb3k/M99pplvp0OWnDleN5Y3Zm8K
+FSSnnD7B58+Ta9FYo8ucbmTT4ypa3YVE1yyrKODzSuY0ZS2zLHkRQvoLUNO9rlxcRb3Kxj6+pXDcrSsk01yS/I+S8TU1C7sJxzvC
+afv5j6tGoqtGe31X+R804rpJLTqmN3OpH/8AiOGu3r4/Gl6MEyWGQ8FZV3G5YgGgfEAGgANAGAEwGRuCQqMmq4m/u1fax/Jm1cfU
+1PEy/wDbV9pH+JKuPrlCADLuAAAAAAAAAAAAAAAAG94SWbuv9l/MjRG+4R/bK/2X8yETLx1HKRjzLlWacFHsVluXaKSKIIySRkAT
+khdCMgWyMlMstkCcroCM+YzkBkMjP3DqsgYbqPPbVId3Fmk02lUpahCEVyySybyvWhShmckl5tleHaNHU+JOVSXK6TafmxHXHxtL
+O8qVLBU5S5Z9MnqtdLhGk3Uec74NVc89hf1LafLKKeY4N7b1JTowws7dDt+Hjy6e/Qr2pRtZ0KVJ8tKTW/ke+U1jnljfqzWaPXnG
+vXo5W+JLPXJ6qtXmzHmW3b1Mud9Xu6kfBlFzXtLH3manQoQtIRhFKXLu+xp9SqqnSceaOexlsrirUpKLllJYZYlhFdfDW6Z7bXMa
+nI1J82/vKWNvGWd29+iNtQtXiLW+OhLU21GuOLs6iiui3TObkk6cZvZpLodPr1tL5rWxFfRfxOfsKClRX1soYumPjV61V/8Abp79
+cI09tFYT7JG34kjGnZcsH9ZZNdaNOm1yrPmX8u8/y9dov1tJLr4if4n0ngXPz25XP1kts+h86tU43FHb66PoXBySvnJuKzUSf3Gc
+3Ot1xTZOlc0LunH2ZezJ+RpZS5m1Hdd8n0itQt7i3dOcVJY7o+dVoxp16qaSjGTUd/UzjemMsWKDVtTnKo1CK3eemDiuItUuOKoV
+dP0i0denTeZ1sbRx5Hq491SpVqUNFtKn62u05tfViXp1lplnDQdGUY1eVO5uP3f/ACW9vRxYTGfVajQ7ud3Zxo1t5QXhzT6m3sYS
+nZVrCpvUovmpvzRz1e0lw9q0HKcp2t19eT+sbudZ2/h31P2vCeJpd4kjWc33GslWdlfQrrO75ZI7rhnUWpSt208rKOQ1q1jL9dD+
+zqrMWjz6Nq9WhUjHOKlB/ejp704ZY7fQ+ItOhq+nzt8YltKL8pLoz5Xf0pUZ5acWnyzT7SX9ep9dsryF9awq0+jW+PyOR4y0Llk7
+ylBck1+tx28pGZ0vFl+K4JVnQqqrDo37SNra3atpRmt6FTrj6rNZUoyo1JQknnp06rzFOt8yfJUTnQn+Bp2yx27GhV5lGUGmn3M1
+1aUdQo8tWO/1X5HNW11UsXGUH4lvLfHkb60vIV4RnTmmn28g4WWNbC7uNDrKlcKUqP1ai6fE2dajpus0kriMZNraa6o9MoU68ZQr
+RTg+zNdccNzpp1NNq+G08+HPo/6EamTW3fCV7aZqafWVen1UJdUa+pDULT+3sK9N93FZN6tU1XS2ld2VWSX1qa5kbaw44sHDw7lx
+hJbvxFgxbY6S79cTT1CaWVRr5X+Rm0sdSuq8vDt7C7qz6YUGsn0Cw4y4Zp7zq2Szvvg9Nf5TuHNOXPTr0WsdKMU2efPly80744T1
+rNA4Y4p1NR/3aGnUn1nXe+PNYPpXDnCmjcOwjc3laWo3i38ar0j7l0Pn8flTq6suXRNIv76WcLlptL4m1teHuNuI0nfSVjQqL+wp
+fSX/AHHjzwyy96evDLGOv1rjC8u6i0/QaTu7yT5I06f0Yesn5I3XCHBs+HZy1fXbiN9rFRfTf0KPpH+p4eHtCveDtNkraxpJ45ql
+RSzOb82y1bXr3UIONRKnD06l48JhHPk5dt7qmu1L7moQk1BfTn5+iOeu66Sbm9o/RQnc4hs8LHRGjva06k50oSzJ9WntFHXVrz2v
+FqN787r8jeYx+k1+RuNH8Gxtqup1pRp29CLbcumxqbPTnXuFQjuurb7Gh4v1SfE19/sxps3HT7Vp3lWLxzP91M64z8Ruf8zdRpV1
+X4j1u74nuk8VM0rSEvqU13+J0CnCFvKa3m0eK3hC3owpUocsIJJRXZG50GhCvfe0o+Barxare+PQ9GtR4rlc8mbiWrV0Thiz0Oy3
+1K9xRhGPVZ6y+CeTSfKXqC4Q4OseFbOpi8u4qnKUdm39aX3m24XmuI+IL/jm/coabYqVCyU17LS61F7+nwPmmoarU424vutZqPnt
+qEnSt16Z6kkei9Rlo+Ho2kc81tRp5+OD5nGvLUL6tfVd3Ntr0R1/yhap4FlRsKUvaqvM8dkcra0eS1jHp3OuE3WZ1NrqClVhFv2c
+5wdPpTVBZl07Glt6cZ16S5cNG/oR5FhrOF0NVwzrLcVJVZ8qm990Fefq+R/SWxltKcavNUbS9Dz3dFOpLlaeOokcpXmq11OWd12a
+PGpNX1rltJVonoj+rT50uvUxVuXxqUkt1UTNtz19e0u5jWpyjGSeY7588HA8aXFGVrpsac05xuJxkk/8zPfpnEVOzqpS5msY2Rw/
+6N1TUdcdrbShOdxVqV6MZvC2l0/E4ZzT0cXb1t+ZHQz3XDXFNgua50lzit26MuZ/dg8CuJQfJWo1aE/3aseVmNlxsejIyVTzvlE5
+KixBKexGUQQNh1DKJ6jcjoSAGSN0PeBLZqeJnnTV9pH8mbY1PEr/APbV9pH+JKuPrkwSQZdwAAAAAAAAAAAAAAAA33CX7ZX+y/mR
+oTe8JbXlf7L+ZFiZeOqznsCA2VwQ3sUbyyzexR+QEEY9CxV7lBogkjIDASAYEYD22JKsCcmysOG9W1SEZWtq+STx4s9or1PLY6Ze
+alXjStbedST9Nl6s+raJYz0zS6FrcVfFlBb46Jm8cds55fMaXRvk702y/X3UHe3CxzSm/ZXokcTfzjafKVeqhSjCEYJRjFYS9lH2
+Gq/DouTlGMVHO7PkOpwp0flGq1ZVE414Jprp0LnF4s7lt4tWhWqKd535sI9lhXXJFylLLW/kefWLxW0JQ8LmhOTWPI8lGrKrTUYS
+cIGsZtzybundK0v4TljE08yyZKt7O7rctD2Yd33ZqMOKjlOXqeq1eJx3w89i6Yr0Tt5VJuL9prvk29Gg4QisJbdTWS2qSxlPzZs9
+KqOunzpvl2wS1itjQpyppvlUfVdz3/OVSp5bwux5aEstKSTXkej5tGb5ZPmXqjnay1utXUKttOLnFy5Xt5nPaY34K9nG7+46e+02
+jOjUlGCc0muZLoc/YUlLmhn6OdyxuXpp+LVF2alh55kjVWaUaDffubbi6E42u8spNM1lvn5tHZYfcsdp/l6aHMq9GT89jteH60oQ
+ruKzKMlJM4qhLNxSSXfJ1/D9RqpcJrrhixzz8d9p2sVri3SnFZx2OX1uhUtr6TjFqjN5T9TbaLXjJSi3ujNrFsrq2aWNt0/U5xcb
+udvkFWoq3Gd1cVN/Ag8Z+JsOG0qlrUrSft1Kjbl36ml1m3nY8XfrJYhXi1ns8ns4cuZW9StYVmlOnNteqbNYu/JP+em/1rR46tpd
+S2cc1FHmhJeaOW0LVJe1bXX06Wac4vuvM7i2m0l7W3n5HIcaaS7C5jrFmmk3irFfmWxz4cv/AJrZ0IQqUp2FR9nKhLzXkc/d29S1
+uFWgv1kHiS80enT9QhqFGEVPkqx9qnLP0X5GzrQjqVt40Y8txT2qw/iWVqzT1cN8QRtZwjzZt6nV/us7G5jTuqLXKpxkt/I+Tpzs
+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
+ZyyTF8w470GrdShOG1WG8ZLszlY1p3VSKnJ29/R9lSeymj7jqWi07yg6bSz1yj51r/CiqtqpBxnF+zNdS416ccutVp6XEt7YRUbq
+0nPHWcN0zDqPEF5rtCVrbWsqVOW05VOmC0tI1myi429xGceymeKpp2t3icLmrGlBfuPqbq444721FOrLTL1xU1OKeG0dZZ3bqqnd
+W8kqsVvnpNeTOXttLdWvOg37UMrPqXtrmvptd0qmVFMzGspt111bUdSou4oRw+k6b6p9zz6ZqtbRKsadduVvJ+zP930YsL7mnGtR
+mlVS3XaaPXWo0dTpznTXtradJo042b6rrLLUo3MIy5k4NZyjYTs1cR5m4uMkfNLO8uuHa3LiVW17wfWn7jstO1ijeW6q0KsZJ9s9
+Cacc8Lj41Gu8NwdR/NVGNR7uP1ZHJ3drK1qOnUhKlPyl0fuZ9OqTUo5l19DzXdlbXVLlqUoVIPtIrWHLZ6+aTjGcOSrHm95SNhCk
+1K3r1LefbyOnvOE4xqP5rW5U9/Dqe0l7jVV9Fvbd8zpSwu8HzL7i6jvOSVFte8RWsf1NxTuYrG3Q2FPjTWbPa70mcn3cE2anwpeI
+k5RjP/M+Vm90W61KxqKUbmcln6DllGbG9Y1jn8oNaSw9JuU8fus88+MNQuaiha6TXc30Tg9z6jotxVuYL51aU3J90dTb0KFGHNV8
+Gn/3JHG51qceL4jbafx1q0kqVr8xhL67xhnQab8llxdzhV4i1ypWw8+FQyk15PJ9IvOIuH9Hjm81Cyg+qTmsv4HEa18qeiyuJx02
+hc6lVj0pwi402/eZ3a3McY6jR9B0jQqPzbSrCNNdXLGZP1yeTXeKNL4apyd7cRqV8+zRpPmm35HF1+JuLtcThz0NJtJLCjSWamPe
+sE6boFnYTdxyOtXf0q1aXNNv3mpx2+sZc+OPjPd6rrXFMsXEpafprX9hF+3UX+Z/0PfZUKNnSVCjTVOEVjYxVKsKfsy6voeWvqCj
+7PNiL6yfQ6zHTyZ8tyrdUq0adNOpNNLp6nnqa3KV9RsNNoO91KvLFKjFZVP/ADSZ4NLsNY4vrLTuG6fPyvlrXtT+zop9eXzfodbe
+3XDvyJaVOjYP9J8RXMfanLecpPq35LJm38OnFx/mstW50n5HLCeq6zVjqfFd9HHsbtP92K7JZPn9rG/4n1ipr2szdW4rZ5E+lKPZ
+I8NtYajxLqc9b16tKvd1nlb5UF2ivI315qVrw/ZeLcTUWtoxz9JmbXW3fUV4g1qno1CnaWy8W+uXyUaa3eX3OR4nUuHrL9D21WM6
+11+t1Cunlyk/qL0PFPiOo9Qq31OUJX9RY8ZrKt4+UfX1NZWq1LyTak3FvMpyeZSfmXHFuf8AMeZT5pRjFYUTY0LmnCmqcFzT9DxU
+7NNzlzSfL2M9GLorMVjPkj0Tpyzu26oVadvb4i05veXmzzSu1N53Wd2eZNRaaTIim6jfbP3Go4abKxVW9u40FnEuvuPoOk6HbRtn
+TcE9t2zjuG4c1063NtFYTyd5b3UIU1nK82c8655VqtX0OFGlKdqsYWXHzRztStz01GipTnLZQX0pb9MHdUIV6+oRnOSVLHsrPU9+
+m6Bpmna4tZrUIvHWTfsxfngz9NYd1m1fgNUOCKtavWlF0bVzlH4N4Z88+RaVJ1NUvav9nTcYR29P/B9a+VXiy10bgO+UZJ1rqCpw
+jnfEtsnyb5KdTtdF0Gt4tCtOrVqZ9im5bLKOXr2eR9KrX17ctwtYK3p9PFnu2vQ8U9HVWpzXVapXfnJ4/I11XjJQqPFpdST6LwmT
+DjCE1iVhdKUtt6bNSacrW4t9Lt7RPwocvm13PR7EqbpVIKpB5WJLOTnbrjOFtUVNWNzJPvytIwS465PaemXPJ3xFl0Kaz8n9ldqp
+W02Xzeq3nw5fRbOH1HTL3SK3g3lCdNvpLGYv4ndf/qNp7nyytLyGe7ovqej/AGz4f1Gj82vG1CfVV6eF+I0PmmcjOGdff8I6TeU6
+tfQtQhOpnPgzqLHuXkchdxqafXdC7pVLeWcZmsRfufciyDZHcJprKGQJQIDbAlmp4m/u1faR/ibXJquJXnTV9pH+JKuPrlSCSDLu
+AAAAAAAAAAAAAAAAG84U/bK32f8AMjRm74V/a632f8yLGcvHUZCexVMlGnEKss2VAFehLZCa7gQ480cPozyz0q2nvyYfmewPsFl0
+m2rXNqoxp15Yj0TZ76PE2oWyxyQqL3s1/YqXdLd+ur03iqnXajcUpQl5rdI6WxurW4/spxln1PmEJShLMJNPzR66Gp1qLzn2l9aO
+z+8v045ce/H1RUopJLGTHcW8KkJRWFtg5DSuM5TmqN1DZbc2d/8Aydxb2s723VS3lGcZLZ56G5XLLCxr7Czp0qfLSpRT6cyXVnH/
+ACtaT4Wj2V5y7q4UW12WD6tpmjQhCMam8l1RqPlV0D9J8FXVG2prxKP6yKzjoMr068MsyfPbmNKGn2sfEUpSpJrPuNVWvuWHhqW/
+c5uhqd9UsaMKlOc4U/ZhNdUl2Ku5qtuTo1Vn0JG8sO3RczlTbUuX0Ntoei+NitWlyxbzt1ZyltqlJckajccPfKOgocRUKEV4dxDG
+Pot4N29dOWWNd3ZxpRhGMYqMVtg2NSwoXUF4mzXSS6o4ay4oipYlKm16SN5b8SKWGoZT6PJwsrMxrbfoFUIqcaymvKRgqOdq+WrH
+lfb1Jo8QW1SnirLka7Gu1nW6M4xUJJuDy9iSXfa3H9Nm6salLC3ytzk7mr/v1WPT2tja2uqUqlNPnWEt9zn7u7pxvJudSCi3nOeh
+uRmStXxO3KklNJ+iNHZSzbpNHv4g1S2qtQt268kvqb/eeDTIXNah7FOKW+7NT16JjrFsLTe5pLBurWfJe91mLNFQtL1XdJRnBSfT
+boe/wNQV1jxYZx+6aYsdRp9eKuHv03Z1ljcRcVNP2cHzmjb6mpqca0E+meU31rR17wl4d1Rx6wOeUcpNO68WLivLyZ5L63ta9Jxq
+uKOXceJuZP5xbtP/AClbihxFJpuVGWDGm/pOo6dSt5Pw5eIn3XY1lezpNYi3zeqPU4a+o70qLwYnZ63cr2p06PNt0yblNuIvbeWm
+6s5tYp1HlN9xqNC3vobNRmujR2suEVc73lSVapjZvZR9yNetChbzlbzgvFj9F46o1tr+zTg6datp9TkqJpeX8Ub2xvlWipxqOE+0
+1/E92q6LG8h4VSPJUS9lpdDlJUrnSq6hPK38tpIOsszjtIXVC9iqd4lTl2qLpI8NTS7q1qyr6a8OPWKfszNfaajCrFxb98X2NjYX
+lxYz5qDU6UutNvYWJ569uncXU1JUdQpytq3T2ujNyrynUSnCSnB9MM1spaXra5K9KMJdOWaxv6GCXCl5bSzpV845/wCDPdMztm8U
+vjbVKiqSc8brbBeMY8rk58vozU/OdV0x51LSqkoxX9pQ9tfcjLS1zTK8eR3EYVG/oTfK0Xcc7x5R669rb3CbnSg30zg111oVnKmn
+icf+mTPaq9PGYSUlLyeRKrulstvuKkuUeGlw5GMU4Xl2k+3iy2/Ex3Gk0lL9ZcXcu29aW/4m2p1oUU8Sbz+B4b2oq2G3tF9upNRf
+vJgjpFjhOVHnlFZ9uTl+Z6rWFG3hzwp06fL5RweaEvD9nO77tmK41K3tc06tanBv959S6kT/AKrbwvYSXLGal6ozz1GNOPXc0OmW
+uq6vXjS0XSbq6lJ45+Rqmv8AuO6035INQlTd9xZrFHTrVLLo0Ze0vTmFsjc4bfXIS1qV3cRoW1Kpc15PEaNJZln+B1Wl/JdXq0Vq
+3Gl/DTbGn+s+aRliUl5Sf9DJdcd8F8F0qttwlYK51BpJXCjzcz9ZnB6tqWv8aXHiazfzdNvahTeIr4GLbXeYY4u61v5WoUrSOh8A
+WEKFrFcs7vlwvevN+853SuHK1xVd3f1qlxcVXmVSo8t/0I0jTKFhbqG0Iw+s/Iwatxo6ebPSIq4rdPE+rA539Re62Ou8QWPC1tyT
+anWa9imurPmOrape6/dfOLuTUE/Zj2ij33VOnOtK51CvK+vZ/Vi8xieVWrl7VXp2iuiN4YNdYvLyqKgsONPz8z3waUcRxjoSqMZe
+zOKaf4Ews5Rl+rqOKfbqdpNOdy2rRnKnKafSRl51KDaW3QrO1cU818z7RUTNS0a7qwyq3Lntg0xuMHiyg0uvmZKc3cTjGEcN7Hoj
+wxczScrp7+SPTQ4TmsuV7NeWCTJLZ+220uMbSnGCaz3eTora+pyilzRz3OOp8PxbaeoV00+mWehaBCKXLqdZf9xmzblcZfy7mGsU
+KSiueKcerYv+IVq1anYUVmns6nL9Z+R89r2vzV8r1KrOUukVu2eq0pa1YJXdtKlTp0/alOpvj3mdNYYdvR8q11Cha2+nyrzuLyth
+uOfoR7JHVcKzq8P6TaU9Rso06E6aarRWUm13PnXC1je8ccZ0611KVanTlzznjZJbpH6GenUqltG3q0Y1KckotNbYOOWcj1XHrTU0
+lb3EVOn4c4y3U47npjaU8JqMXj0NFV4c1DQ75vTK2Lap0pT3Sfl6GSnf63bT/wB6079R+9SlzNfAzbvxykreu0pdHTg2+7S2PPUs
+qPLy+FDL9DJaXSulmHN6qSw0eHVOJ9J0tuFe5j4i35IvMkZlrfySsKDfLKhTT9YoxVNMsqizK2otLrmCOX1L5RI1eb5lbyz0Up7H
+O3HFOs3LfNc8qfaCwdJtOndXtpodDMqkYU309h4/I0t9HTLug6UazqQSeFNZx8WcpLU7mTzKUXLu2stlKl5cVU1KrJLyWxuQ28uo
+6RKyrSnZ3kWnv4b3RFvKpUpp1Icku6Mi2ALdmA1gnqiGEQariT+7V9pH+JtWariT+7V9pH+JKuPrlQAZdwAAAAAAAAAAAAAAAA3f
+C37XW+z/AIo0huuF3i7rfZ/xRYzl46ZDIIb7djTilshvJGQgDHQAAx3GUQ/MCfiGVTYl1AZXUnKexCCAhx3znBveHeNL7hq6hKU3
+Ws5PFam+uPNepo8ESipYEH6G0rUKOqWFG+sqinRrRUoyPRe21fUNOubZQjmpTlFN+eD538lXENvRt6uk3NdQqc/PRUnjKfZH1Sg8
+R67+Z09iTqvypb0a/D2qXGjapHwqlObwn0bNnKhKDw6biscyytvvPrnyh/JbaccTVxbzVrf09vG5cqa8mfMrvQ+NuDGra9039J2c
+X7LUfESXv7GJlY62TJrK1KnBxlOlHEtuh7rfTrSvFZpwZqa/F9tOrKldaTKg84ajLHL8MHvste4eq8sHXr0MdW4m/uOWXHl+G8tt
+D0uSXPbr1w2e2nwbpNXGFUh7qkv6mi+fWUMu21u3lHqlNYfuLQ4jr00uW5tKi/y1ENxy+M3RLgLTqu0bq4ivSR5rjgW2hzL59ctf
+A10OLK/RYePKWRPjWq1/ZN482TR/0pV4Q0+2hKdSvcNN9Odo81loOn3FR4pS2fWU3v8AiRV1mpqE4yniKfbJkhqVhYRcqt5TUl9V
+Sy38C9L/ANPHxBQt9Mtp+DCMJS6LHU9Wj6d4GnU5zWJNcxobm7vdcvoVqFhc3NCD9iMINqR11lw/xPrVD9ZClplJbJSWZY9w26fN
+1219q1X1R4WIwi22eidSLvVuliPUy3HyfXVKtGlDWKvPNpy5I427nj1LgOUK8HQ1W4WPpOWWXus2Y/tt7apCSy2se83djcU6NNYl
+ldkzkaXA1dwzDWbhemTDe8N6pp9OPh63Vm5PEIY3ZLHL5x/b6JG7jUlHE0vImpdxi8Oax5nA0uFuJYJShq7y+0kUrcPcWLOdSUve
+Y01MJ+3fq6pqOHNNdiad1SeHtnsfNa2hcZRw6dzTlj/NgotM44pLeVOS/wCsaa/rn7fUlVp1VnK9Twata291QzzqE47wkuqZ83nP
+jKhnma236nkq33FM23OfK357DSf1z9utq3EVPwLiKVVbKS6S9TW6lZUbmDU4xaXl1OXqf7RVpZlNtx9SZR4gh+snzYXdvY3Ks49X
+qovtGrW78WhmUOu3VEWmpSjLlqvla+t2+IoPWb32KPNN9NuxN1w9rLTlXpR516jv8O8svVbKN7Sq0+WphLs0e2wvLi0nGpa3Twvq
+y3RzNhp+oU7jweVPO/I3syXDUrG4cqlvVjDPboibT4/T6VZcX3dFr53ZwrRxhqn/AOT0T1jhK9hKN7ZwhOp15oYa+KPndrrqnJqV
+Tl/6jYU7jx4pxqwedtmT5lT6yxdXLhvge9xO1u6to13jUfX4swf7EWV1VlKy4lrQh0xLl6nNToU5fThGRMLeEfajGUX/AJWPk+//
+AB1tv8nNes1F8UYUtt1H+hsIfJRRUn4/GDgsfVUP6HF06TSWa1VeXtFatGnLLlWqTT7OWRqp94/p2N3wPwNpNNT1biy5u4p5ahy/
+dseWlxL8mvDVSpPStKqalWe6lLMv/wDpnGTt9OtfacKUX1yzwXGsWdL6C5n5RQ+Wpn+o7+6+WbX7iPgaNpdpptDs8Yl+BzWq6hq+
+v1fF1nU7i4zuqalyxX3HNf7R1XmNG3W/TuWitXv45bnFdlnBZC2/lt6tWx0+motwivJdTyviuNvmNtQ55LZSl0PJLQLzDlKMZv1Z
+5a1rcUVyztJRS7x3FlJ816LrWL/Uo/7zXcab/wCHF4X9TFRqPk5Oflj5R7/E8clJvOKi9OUuqdWKy4VUvNxJJpu6e9VYU0lHCyZY
+SUPa5lI8PgXMkmqFV5/yFZW18tvBrfCJvbncZ+2ylVhhOckhGtKosQXLDvJ9TX0rHUsqUbOs/JyieunpGt3D5qdrJ4e+di/SXGft
+77ZW1OXRyk+rZ76V3C3XM2pZ9ehqKmh6/RxOVmsem+D20dB12ouaNvbzT/zIsy253CfttI6jTjFNyjvv1MFPWoQqP2uY8b4c4h3S
+srf38xWfC3EU0o/N7WCa7SJ9QnHj+3vuNVpNPbmqPtFbsSnUq2/PRp1Zy+5L35PPa8LcRw9mE6FHs5R6nvfBfEN9GMK+sShD92PQ
+lyWYYz8tP8/paLdOtfNVK76Ri88p6qNxr3H846Vpdo6drzZnUWyx6s3mnfJhaW1eldXU53zg81KctlJH2Lhi00ujp9OGl0KVClFY
+cIxw0/U5cmdkduP5/Dn+FuELXg7T6dK0xVXWvVx7bl5+47ChKNeEXHEovoz0QsF4vi/RzthLqZaNtRpSk4JQbfRdGzyXLbvMa8d1
+Zxq0+V+/JrNWvLXSLGdzd1FSpRW8mb+tByiktmfJPlkqXKuLKl46VvKLcqS6yl5kw7ujLHU21esfKDcV51KWmS8Ki+lVpczOUnUl
+Wm6lSTnOXWT3bMSRdYPXJp5d7GCcEdyiV6gdSMeoD4joMLzHqA9RnYd9h3AjfuariX+7l9pH8mbc1PEv92r7SP8AElax9coADLsA
+AAAAAAAAAAAAAAAG54Y/aq32f8UaY3XDH7XW+z/iixnLx0m6GMjqEacTGB02DIfvAN7EZz2A6gR3JzgdAAz6EYyCV5AEh7yO5KYA
+ldQMZAjeM1OEnGUd1JbNHQ6Vx9xJpCap37uKeMKnWWy+PU5/oMDY+rcM/K/QqONDW6Hzebf9vT3gv4n0Oz1TTtYt+a2u6FwpdUpJ
+/gfmRxyupksbq50i8jeWFWdCvF82YPHN6Mq7fe9S4V0TUpThc6ZQmm93yYb+40dX5HuEKkm3pajnf2Zy/qdPwhrceItDtr/CVWUe
+WrFfVkupuakc7QXXds10xuvmd38ifCqg/Dt6kW/KRp6vyG6c8zpSqxXkmfTp1alG5m6j5o529C9W8nOEvDSjtu5dEZZ/syfHKnyV
+6Xbpqda5i169TxXPyfaVY0pV615XhSSynJ7v4dz6Fq/FFOtVdhpVstVv0msx/soP1l0T9DV2nDVa6uqd1rVZXV7HeFKG1Kk/d5+p
+Yfd/Li9N+T2lrVSFWj84oWaf05tqVT3LyO40X5OOG7GUa709VKsfrVG22dXb2UKFNc6zNLHoZZVFy4cMNPGUKkzyrHSsbO0pKNCh
+SppLZRikWrUWoLkhlyLwtaiqcyzyPzPfTtoQWG1v5mblI7YcVvrkqmnVKUpSrrM5fXXRLyPDKwUJSfstddzu6lOkoT8bkjCO8s9M
+epotasKd/YVattQVK3Ud6q9mUvd5L1GPL+Gs/wCPqbcfe3UXN29hR8a4zhyX0Ye8vbaDdUYK6ko17iXWU+3uOotNCt9MoR8CCTSz
+J56l3KO8unpk6XJ5LJHNVrq9sk3UsW4x6uJk0753r0ZSo0FRgvrz7+49msXLjY1Ipe3PCTS2WTNCvG1taFvSfIlBZa7szazrTx19
+DuKMW3f00/Jmqn+kKVTarbVI7pdTaXVWm4uL3a7tnhlKnyN4z5CM2vHU1G5oPFawdRecMGP9J6fdSUalLw5+Uo9DO7iFNOpOfKsb
+5ZpbjVJ6zX+Z6fTi/wB6rKOcL0KyyajqFjZvCSqTl0hBZbPHU0u81Dkq3bVKlNpRorrj1N1YcO2+nYmo89Z9aknllq1RyvMOScaS
+x07lXevFbe1t9Po8lCkoxx2Nbq14qFvUrzTxFdjdUKNS+qKnQi5zf/3k8XGNlR02yVj7Mq81z1pdcLyQ21hLa4Ohc3Eq0q0ZeHUq
+ZfM19CH9SafEVaFrOFWCq1HLHNL909lGnzJuaWZdTn6uI1Jx8pMxt9DjbfTba0vqNWVelF+28NdTC9MoW914LlOMKm9OcX+DMmir
+/c5Pzmz1V6Kr03FvDW8X5MT1Mqwfoi6i14V7LHqTGy1OnVjD5xTxLaMn0yevS68qydCq8VafX1PfKHjRnDGPLHY7SR57lZ1WtqaV
+rcsR8ehj0yau6sr6ldeBdXCi30kujOusLp1YunU/tIbN+fqYNXtKdxSeY8zSy9x8szku3OS4clUSdSvKSfkRPhmNBKpFeJFdU+p6
+qVevpiTbdW1ffq4m7tq9G7pqdPdYGotzyjSW1jRjFONNRa6bGwt+ji1ytGWSaqNyjiPbHYvWlFrCioyx9JGmLltMHHePX1MvzdVa
+cpYTaXRmvhXnS9ltZ88nvtLqMIPLTm+/UMXbBQsqVfLdNJd9t8ns+Zw8PldOMl0exg8eVKo5Y9mb327nrjUajzReF5MmjdRRhUs5
+Llpxq0f3Me0l6G0taFne0uehyt901uvgeWnVUo52yYq1tzSVa3k6NfG0l394Tdbmjaxg8Ont0yeh2dFLmh7MvNGmsdfanG2vUqNb
+tL6svibeN0uqw09veYsqbqvO6Uo060evSS6Mx1rZwk6tryxl3j2kZq1WNSm84aaxg1cripbyUJZdOT2fdejIsrY0NQhWzSnF06i6
+xkG8NYe5ChQvIKNRLmS69GjBVdxbSfNB1KXapFZa96G0evn5Y5Uc56oz0pvo/ZfZmvoXPiKMqbTi+57aPtR36Ae63ucScWtvM9fz
+uppU/wBIW81Hk3qwbwpR7/E09WrGhDM5qKW+WaXje/q0bSzoc/Irn2+RP6UPP3Gcpt04rdu0uvlm0ONPNtb3VzKPaCxv5bmjvflk
+vK0M2GnKi/8Anv8AofPJS5iF3OM44939tdpW+VriSpHEYWlPbrHOUchquo32t3vzvUbqdxUWyzsooxFcGpjIxc7UJEpeobI3NMrZ
+BXL+BIE5GSvUkCc7EZCAE9uoIx3IYFsmp4lf/tqX/Mj/ABNoaviT+7l9pH8mSrj65UAGXcAAAAAAAAAAAAAAAANzwx+1Vvs/4o0x
+ueGv2qt9n/FFiZeOlzgZwU8yUacE59CAO4E9SB0DAYDQAEYJIySAZCeUS9yEQThk9iMk7FBYwO5BOwEB/SJMlnY3OqXtKytIc9eq
++WK8vVgfS/kRub1VNSt5RfzGKjKEv876/wAD6tUnDws1JRpwXVt4NFwfwlU4c0CjZ+LSVfl5qlRR6yZ6a+gU7n9tu6twm94ZxD7i
+7LGk1fiuytrmVtp1Crql2v8Ah0VlL3voeOpw7rfE9NS1q6+Y2z3drbPDkvKT6/cdbbWFhpsfDtqFKjH/ACxwUuLu3puLq1Ywj69y
+bZmLx2Oj2elW8aNjbwhHu0t36tnqlZ8qi4wgk3u8HkvOLtDsH+t1K1g1ty86NJffKfoNu9ridZYz+rjlE3WviN/O2qeK1hOL7+QV
+tKKTeNnn3nA3Pyw226trCrPfrKXKeOr8rdzNPl0+Kz51P/Au63jjjH07lWObO67FJ3fhezSpuvNrOF2+J82tflWU2o6jY1FS7ulP
+L+7ufQuHNW0rW7ZVdOrwqJL2qaeHH3o53GvRjyY/h6dM0+pqk/HvekHtSj9Ff1N9VsKUrd0Z01yNY5UtsFbeShtFdtzNWu0uVbPP
+dnPVb+5XK19B1WFdWltOn81bz4s37UV5Gl4ppLhuva05VfEhXTy5YWGfQHOUmnBbdHk1Ov8AD2na3OjUv6cqqor2YZ2fvO2OV/Ly
+cmOP4cNp9nV4gU4WcoqlB4qVnuk/Jepv6XCmn2Vu6l5Xq15Yy5SeEvuMKlb8N3c6drCnRsprmdJbJS8zy1tVvdUUpULWcqSeEp+y
+ma246kjVXNvQVSo6eeTPsxfkabV9RoafQc6jUfJd2evV5ajTmnUq0qMpfRow9p482+yNMuHqmr1lVrVJTjF+1J9H6I3Hns7aSnSv
+uJrlP2qNpB5bW2UdTodjRoU5SpxUebZbdEj2VralpunzjRhGPs8qWO5ktqbha04yjh4WceY2lqKzVKE6vNnlWTWabptzqdTFOnnn
+lmUuyR0L0ete2sFJOFOpNQW28lnc6qz0i3sKHh0YqKSw8L8R9LhhtooU7XhrTpTpYnUxu31k+x8u17UKuo3c5VJZeeaT835fDodf
+xxqVG3pyoUp5cW4xXecu79y7HAZby28t9zD0446RTzFo566pt3VbHZ5OiWzNdOgvC1Cu0sxkkviix342TSI8tjH1eT2+h5dN/YaW
+2Nj0/AVzy9ea8jOk43NHCnT3l6xOj+bXNta0ridJ+HVipRmt4tNZNOt1hrKe2H3Ou4W1mxjVpaFXSjQrRzS8TePN3j8dzUysZyw+
+o5K6rzoXEbimsrpLHczSvvEgk1szvdZ4SslTmqFBUqjWUo9Ezkrvhq4VJV6WM9Gl6HSZyuNjSW0o89Si/aWcpPyMbs7iwm61s2k3
+vTfR+4zXFhc21eNWUVjpJo2XgVfCUmm9s7o3NLbp4KOp1qz/ALKE13S6ompcyk2p284pGG5tpwnKtQ9ma3a7MzWl/GePEi4y6PPY
+lTTE6tCSy8xfqj0WlxCK9nHU9Up0XSbUed+48MraSqc8KSS7xRZWa9lxW5o+1he49HDdOlqOoxt7lOVPleMPqzyR053EYuE8Z3w+
+3odNwjpsKVxOVzyvb2JR+qTK9JNPLdcLavQr4t6fi27ltNPeK9TrKPAVpd2dNq6rUa+N5rG79x0Gmq2qQ8OM8tefVm0o0FSz1yeb
+LkyevDjxsfLeIeBNUtabXJ87opZ8SC3S9Tmbe5vbGSpVlOdJbKXePvP0AmuXEsYltuc1qvDehurUuas4UFjfDwjWPL+2cuD9Pmkb
+/wAV8qfN7uxsaenajc01KnZynBrZ+ZsrqfDejV5XFpe2cpP6dJtNS93kzB/+qmj20WlSrZWyUIcyRq5/pjHg/a9noWpyoOatZexu
+/MyQulHMWscuzWNz0WHytaE4vKuKf/VSayUXyjcK3F9407Vxm9nUdPr7zH21f4/6rw1dLjdPnoU61KfonysWsp0a/wA3u9NqweeX
+xk24NHSR+U/hikseO2uyUBH5S+FsKUrjLltJShsT7qz+PGy0bhm2jQVzKnSuJSWOuYpHzX5XNDudO1yw1DObKUfCgu0JeX4HfUPl
+A4StpOpa6hCk31pr6P3Gq4q4w4V4o0G40+4uI879qnLH0Zro0zP1bXWccxnT5ZGRPuIX5E9zbmnsRjYDPQCMBIt0IAMbALoBDXkG
+mSyH1AjoEyeoYEZJyQOoE5yariTbTl9pH8mbT4Gq4k/u5faR/Jkq4+uWBJBl3AAAAAAAAAAAAAAAADc8M/tVb7P+KNMbnhn9qrfZ
+/wAUImXjosbkh7sG3AGQ/MhICQM4DAAgIA2vUZCD6gEANgJ2RO2CrW4eewFsdAyE21uSA6hZjJSjKcZLpKMmn+A8gBu7LjbiOwSV
+DVq6jHZRkk/zRtKPyr8SQWKlShW9ZLD/AARyBGEF2664+VHiKsmo1KNHPeKy/wATR6lxFq2rx5by+q1IfurEfyNa1kkhti+a0+/N
+L/qbf5l+RJF+hDKbQooyYRSKLhDCZ6NK1K50O/hfWNWVKpFrmSe015NGDsRJJgfoLhriajr2m0r2k3HmWHF9pd0biFfnxKaWx8g+
+S/UZQd1YPOFirH+J9KV+4JPG3dkuMLyabmrctNNSwjWX+tOmlFpym9lFdWQ7t16f6uGWu/ZHidCEJOq5c9R92HO5PHKhGpW+dXaU
+2vo0+0TxanrcqMGoLZ7QitsmTVdQVrRlVniEe+3U5a2jca7dZjzRhn2pfux8hIzcntsNOnqtWVetN8rf6yf73+VehvqtkqVFQoqM
+VDpFIz2FjGhTjQisU4rbBtqNCjCOWs5+8u3O9uKrWde9u6NBUZvfna93Q3un8Nt1VVu5JQ6qmj20IQnqlWqm8QioLfo+57qlaNKE
+pylFKK3b8ippivqMXVtYwjinT5nt222OO4s+UK3sp1NPtKjlWUfblHt6e8njDjaNnp06NnP/AHqttCL6qP72PyPlWHzSlJuUpPLb
+7slenCdM1zd17+5lXrzcpPZLsl5FVgqupZbsjRLoUdBT0bUJrq5J/gXktj32kIPhm7qSazLOfvLG8GosIuNpST/dPTjYx0Vy0448
+i2QzfVmY60PEjy5aa3jJdU/NEtsPdBH0bg7i6lrdrTtr5KF5FeHJ9ptHQWthTiq1OSXsy9nbzPkejezdVacW4tpTTz0Z9E4c4j8b
+NO5lmtTWMvujXz10453tlueHKNWVSKgnF7vKPDQ0Tw829WOZR3i/Q2VrrcrnVa0Z4jRilhLzybv5rC5Uaza26Y8ibsY9cBqGgxi2
+3DDfZI5jWtLrWMqdxShu5KLjjqfWNXsozpqcFjD3ZpbiyjVVPxYp4mn7zUySXTiNJjVvqb8OEZb4cX1Rs/0dOElmlKC82ZrnRaun
+3vzm0ikpPKXZ+h0ul+Ff0VslJL24Psx9Je3NQsI0YKolv9ZHUcN6Y7qElTcfZ3w+p6YaZbNNTppe42+gWVtaXMXTk1zbbvqLmmM3
+WGy0uvC9/XJxjD2k13N9WuKdrQlVqyUYRWXLyPXUjFP1fc5vjtqPC1+4N5jD6SOV7evDpw3Evym3FzUlb6TLwIReHUa9p+44i/ub
+nUp+Jd3detLrvNpfcilzTULqqo9ObYoWTTdyrGqMF9VP3llSgtuVFsArPaHGPTC+4hQjnLS+4tkLcG1fDhnovuQdKH7sfuRfoR7g
+u6hU4J5UI/cg4r92P3EkoJtHckbACSMEZ3HYCehGQye4EYJ6bAJ7gAww1uBDD3GAwIJIyOoEmq4k/u5faR/Jm1NVxJtpq+0j+TJV
+x9csQSQZdwAAAAAAAAAAAAAAAA3PDLxdVvs/4o0xueGf2qr9n/FFiZeOizuRkA04GdiUyMB9QJyGEAGCOhIfbYACO/QkCCQAGPUf
+mTnIAJk5IJ6gOu47D4jAAYwwG8AQyfgVXUtkAQyX+I7gTFEhACUS3sFnODYaBotfiDVKdpSXsLEqkvKIHZfJvpc7ayudTqxwq2IQ
+T7pd/wATtk41I7vKkuhjVpbWNOnb0+WFKjBRjDsjBWulSSVKm6mX9UOGeXbaQrxdL2GljbCR5Lu7jShKpUkoqG+TyO7u1TnihCKS
+6ymlg5qvdXvEtzHTaDSpp5nNdHuNM7Y7qrccS3sowzG1p9/P1Om4f0+FrbJRjht9X3M70yhptlTt6MGsNJy7v1NjSo8tNJ7tLsCr
+Qjytvp2ZavUjQoyqc3ToUp0m48zzt2Z576nKVGdWScaSWUujb/oDTNa27pUOao/1k/afvNDxJqtOGbeclGnCPPVafby+83VxcKja
+OpJ4ioZbz0PlHFupTnzUW5qdxPnkpfurZFjWM3Wivr2pqV7VvKv0pvZfux7Iw4Edi2Mkd0JFkIokgiS2PSqjocJV8x+lJxX3nmlt
+FntvY83DNGCXWrvv7yt4NdTyoR9xbfsRHoiyeQwh77MEsgD06VyvUoJ/Wi19x1Wk2nNXqVJNYWxymmRn+kKUoLPKpNpe47vQcTtF
+iK56ktsHSXpw5fSzSp6jJ4ftRWMnQWNxVoqUJfQ/I815p0I31nQl7L5Hlru8Hsjp1xFp55ttkZ25yae6nSVXZrmg+qNfqNh4afLH
+MJdGuqM9rG7o1MRg5QfWL25T3UZtV34iSlHoZa9aJUqMqfJURp9UlLRrqlc27y5PE4L66/qdnX06Fw3Vgkpd12ZyvEmnqE7ab2jG
+snJfAM6bCw1KjqFBVYSTz9XyPbSqQpShNSa5XnGTkb62raDWd3bJulU3cT0WWs3Fakq0rfmg+jg8/gCPqVKauKEZw3jKOxhu7KF1
+bztq1NOFSLjJPoaTg7W6NenKhOpySi/ZjPZ+46ipiXtSecPojNenC7j86cSabU0rU61pUy3ReObH0l2ZqHufZ/lN4S/S+mz1CypJ
+3tBe1jZyh5fA+Lxy208rDw8ll23YumH6FdgVFkgR8SdwAa9SMsdQD2HUbD3AMjLA6ASQCuWgJx5EkJkpgAT6kMA2MkMLYBl4BHxJ
+7kEjtsVbeScsBk1XEf8Ady+0j+TNoariP+719pH8mKuPrmCCSDLuAAAAAAAAAAAAAAAAG44a/aq32f8AFGnNzwz+1Vvs/wCKLEy8
+dCkS9h3IZpwCSCVgAAOnYAAAAfUgkATgjITAnoxvkjO4yyCR3AKAC8wBIIyOoAkheRKAMYGB3AtjIy0SioF6cZVJqnBc05NRS82f
+buCuEKWiaLGrVf6+pHmm9s58j538mmhx1fiFVq6zQtVztOOVKT6H2LU7mnQt+VuNKmu+cES3UaWnSp0nLnzObbbcu5561w6WeXC8
+/Q81S/qVpv5rQdTf6c3hGg1a71Kdf5rRqQcqm0uSP0PiajzWbq2paxU1GtLT7Kbl/izT+ijruHNLttLsY+FvOSy5vrJmj0rQo6TY
+tPE6sk/Em+rN9pDfzOm+ZtLO3xFVnu4zq3NKlzLC9qS9Ox7FmMevsniozjXnUr7+17MG/LszptKtIfMFOrCMpS3yZtbxxuTV2sHK
+PTmS6ep5tZzKnSpZ5fEmo4NxUouMmorG+yXY1l3HnvoKcfZpxcm32ZJW/wCt4NWo06VpK6uaihaUY89RfvYXQ+I6rqUtZ1S4vpR5
+Y1JYhFdIxWywdl8ofF3z+t+ibKq/m9FtVZJ7Tl5e44RLHkWNTHSYpFsEJFkiqjpkjfoW6DGwEPKyz2agpw0y0p5W8uffyPHJ4Xln
+Y2mvU407expp7qllhvDytRBeyti+O5EU8Il7IjCGir2JyMAb/gSvTo8R26qxjKE4yi1L3H1q30qwtp+NSoRhJvZeR8N024+a6jQq
+t45ZLc+3abfU9Q0qnc093H2cLqVzyjVcRyqUtU0+pQXM1KScfNYN5aVI16anBpvo15Hg1K1nGpb3VbCnGosRfZPY3NWy8DF5bxx+
+/FfWXmS1iTa9ClnPNFp/meerZxjdSk28yRt6PLKMZ5znoxWoqKVadJtZwvUm2vlqOV0ny78vmaTiOmrjT6vJHM4rKwdLXp82fZx6
+eRp7uilCaw/aT28zTNjUxVO+tIxmlJTicxOnV4a1CTbcrSbzL/L6nTaTtbui17VGXI/NGbUdPpX9CVGSWGtngOZw/C2u7uXNGMoT
+gnF9H8GdBTtrqxblZ1nWhnelUfT3PzPmun3VXRNS+Z3EpwhKX6qb7eh3VrrVSjFZ/WrzXXAsdMMtNzaavbXrdGSdKqvpUp9f/J8e
++U3haehaz8+tqTdjdZk5JezTn5fHqfUqtna61SjWpvkrR6VI7SizBO2jq9rcaLrEYzVSPLGcvreq9TPjvjdvgvuI7I92uaPc6Bq1
+zp9xBrwpNU5/vx7M8K39DRpII27vBLADA3Iy/QB7ySuQ+oE5wgO3QgAmNwu43AYQJ+AAh/iSmQOgE5IY3ADAG/QAA2PyIygBq+I/
+7uX2kfyZszWcRf3evtI/kyVcfXMEEkGXcAAAAAAAAAAAAAAAANzwz+1Vvs/4o0xueGP2qt9n/FFiZeOiIaZfoRgrgrgkYHZlEkY3
+BKIID6ksNAVBOCMYKH5BDAzgAT1CwSuhAQGQAQAZQ+4ZIJzsA7koglACUvUglIgskY5vlZlW6PLdVPD37cyX4gfYfk3sZ6RwzK/q
+Rj4l1UzTXdxeMI3d3FVpeJcydWp2j9WJtLXTaVvw9Z0FDLpUY49GeC5nBJKftVJbRivMTtz5GpvK84pU7bepLaMUtl6mOz0uFOvT
+py5p1F+sqT/zeRt9O0yca+ZQzOby8o29jo1SVSq+TEpS+5F2xMbWnrW7rwVCCac/Z+Hc9PzNtwsbbaEceLLyj5e83dfTZW1GcoOC
+njeb+qj5fxb8pEbJVNL0GXNVi8VblrO/fBNtzj06XijizR+HYKlOfiV+1Glhs4rVvlb1y9iqFhUjYW6WEoJOT9+Th5SqVa0q1apO
+rUk8ynN5bZdDTcmvHSaf8ovEmnVvE+fu4g3vTqpYf4G+v/lQhfaVdSp0Z0NRqRUIr6q23aPnqLLZDTWzLnJyeXJ7tvuThEpIPrkI
+YySMfeSQVa7hfgWaKlEwpurVp08N800ja8TqMb1UUm1Spxj+CPPodq7zV7Wks/Sy/gejiNr9J3Czl8y/BYJt0n+WoSwgSvIjD+JX
+NXA/MnOCoESW22x9N+TTVoVFK1lLLnHOG+klsfMn0Pfw7qr0fWaF1zNRUlzFK+461TVTTpylHeDUvueTd6XT+c2dNprlcE2vgeGp
+yXdi2lzQq08x+KPRw5dYt6dNLZLlfw2M1iTtn+YVrV8kczo9Vjt6HspWle6t2mnHk3hzd2e+lLMc9H5Fqt/bWzUa1enTz2lLBh2m
+LQ31pc3FSNW2hGUJLE4v6j9TU32mV7Wh4tarCcm8cseiOorypPmureUZRkvbjF7P1Oc16c3OnzP9RjKfqalc+TGTtyjUrXVZxb9i
+uspf5u/4HvaSin3xsYdToSrUI1aeeak+ZPzXczU3TqU4VI/WWc+Rt5mp4g0qlqVq+aKVWKzGS7Gq0K9liVnczauKSwn+9E6WulJc
+nXJqOLNErUYUtVs0o3FJLmXZom1kbjSZ3FG8g4TypbSXmdNe6bC8pdeWrD2oSXWLPn2h69VlOnUdPLT+r1T8sH0TT9Vo39PMcwlh
+ZTWGTJ146+f8e6JU1iyVacIwurN7tfWj3+5bnyyvTdvWdNvON0/NPofpa+sad1HxHBS2cXnumj8+8X0YWuu1reGF4cmvhnYY3brW
+oeCMhvINIZHQDADbrgL8xkdwA9wGwDBGcEtoPdZAcwzgjBAFtgyMZ2GcASTgjmwMgCSrlsF1AEEvoAKms4i/u5faL8mbQ1fESxp6
++0j+TJVx9cyQAZdwAAAAAAAAAAAAAAAA3XDH7XW+z/ijSm54Y/aq32f8UWJl46XqCO7HQrgMhrBONiGBGQBgonPqQwCAMhkMoZIy
+MjOxF0Zwyy3KEp7FRb3jmXYqALZTJW5XJZMA0R+ZbOxUgkdgEygWRCJRBdZwZ9G039La5ZWTWY1ayUtu3X+Bgjn0O5+SfSFU1atr
+Nw0re1g4x5ltzdc/mIPquqXVLT7OVSb5YxWEv3n5I1GkWlXULnx6yalL7oLy955+WvxNqMa75o2NJ/qoP6z/AHn/AAOiuNR07h2z
+c7y4p0YJZ3e8gx87rZWttC39nlTfZsi5vKWnxdatXhRglmUpvCwfL9c+WmC56WjWsp9UqtVYS+BwWscTarr6f6QvalWMv+GniH3E
+06Tp2nyh/KdLUlPStGm40HmNaunvP0R81UFHoWUV7gXRaLqWwQupcqCwTjfJC+4lE2CLYIJRBHwJGSQIfQjO2SXjBWfQDpOCKHia
+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
+dcPJPKlLKl67GSEIzUt8NrpjqBjhHma36MtKKlNpPOOpai4Z5UsvzZXKWcbb9QIxFyxh4Eajp55OndMR69CE15bgeiHLUpOOOv5n
+i3TwehzlT5ce8xV4ctTK6S3JUqgG4/AMoM9tTWfFn9FdF5sx04OrNRXTv6HomksKOOWPRAkMuU8+pV+020yYRy8tpYTZVy7R2T+8
+rTJCcse0k4ruy3ic0W3h+S6IwrOMLdBNrPT+hBki0k21jOyIcXHbGz7h+ziPXCC3e7+AETe2BClOo4YW2+WRGLm1GK9rsZalR0qa
+ox7dX5lVWcZZxsox6epVcud3n3FOjJ93xAtLy6Ix1ltGXwLcz5sdS3J7E+byyRHmJIW6JDIFv7gStuwQ9QPgPcA3I9w7dAA3GcAx
+1KnK+SO85bKIWTa3JO5qRtqa3lvJ+SNtXrq1oKOz5I/cjxWn+4U5SUlWrPeRjvq0Z4ipPmq9V5Gb29OM+Yx0W5R539Kb5n7y/NhF
+YpEmnmyu6lyI6kMfAIssDYr3BBYFV7yU9wJYKsZAt0CK5ZKZRL6jt1I38wQMocy8wRt5ATzIZIZPuAlSIayF0AEJIyUnFVFzLKZQ
+kbGapbp5cW0YJQlB+0jNRqPDj1a6F4zjP2VjPdMqvLkHp5aeXmmkUnbZXNSeV5PqgaYCc4JlTqRe8X9xX0wESGVz5E5zkglSTJ74
+KJFgJI7AZADYeuAgJBBOADK/W2LYyCgSRkc3qQT1aS7nohhzjFdILLMVOPhrmf0mtvQywxClN93tkRqRHPGU3LG/U0vFMcWueznH
+H3M3CeNu/mariXEtLT7qpFfgxWp65MAGXQAAAAAAAAAAAAAAAAN3wrFyu67STxSzv70aQ3fCrxd1mnj9X/MixK6aU22unqiJTy8b
+eo2k9tn+ZSX0jbCMtrrnBbkcvaS96Jb5eiRCeHzJ/ECIZSeO5ZN8ya6olvneWsS/Mqsxlh7MApNS5u6e5NTrjqiN3lPuTL6UMbvA
+SJWNlLZ4Ixy4j5/iGsvr06+pak8OXMtkspsKieMvPuIqrmoQl3TwyVDOXzJslQk6VRP3hKwZKtgtTp880u3cjL0UP1VPm6Of5CSb
+TwuvctKSnHbCx09xjba749A0RbUZbCKeeZ4Q5m6LfqVUXLcovstovL65LKKnJKSxnuRiUdgs80feQTL2ZSa8zHvlY6lnLEn7y6ao
+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
+/wAAIc1SXKt339DT8Scn6PzFNN1I/kzaOOM8zNVxHhacsf4kfyZmrPXMAAy2AAAAAAAAAAAAAAAAG54Yz86rY/w/4o0xueGXi6rf
+Z/xRYldNJ5pxyt1sUlnCeHsXTfJJeWCMtrGWbYQnnfsiH7Tyy2/KspZK8uH12Atz52mtuz7ohwlDEuq7NDCW7yyablDPLvHyYBe0
+9+5kt24VuVvaSwU5Y1Povkl5F6FKrGtHMfZ8wMcVzSaSyJ8vRdETUfLKSjss7+pVRbeAJi04ST7Drsi0VHlkl5FU+Ver6sC1NfSj
+nOUVhs3nZYClyTWDPSo5m5S/s47v1Amn/u9LxZ/Sf0V/Ewe1UzJttv1LV63jSy+i2SMeUpZ7eQRLWOr6dhhNrC3LQi5y2i8deg8O
+eXnEfiFQlulncmUknt0LQjCKbdRt9NkFKlHZQcveBEG5TXKmw6fI/wBZLHoi0qssYXs+iKN5ftfeA8RpcsFyrz7lUsPZ9dycPKxv
+6hR3xJpARnm2xv5loKOcNPIjH2tt/LAnLwu6c3+AFalVx9iOz7vyMbDTzl5yR95msWhBJCCJx6gAAyCWQNCSACB8QAgBJHYkBkEE
+9Sh8SAwgAW+wQAABlENpDJD9SOUmhORzEYCQFlIsnkx4wStgLBDmWSckEE4HUjIE9GMDqABAbGSiUyVLJTG5ZLHcgyU2m3BvaXR+
+paUnH2ZLODC+plTVWG/0o9fVFjUIxhLo2n5Mq1ytp9QnzLYsm5NRaz6lVMnzRWNx1XToGoLMU2veOVpZSz7iifEl0wpL1Kvw5PG8
+RFptx6ENLPcKzQpOcJQymusWYqicXGD6pBc0JJxe6MtdqpBVorfpIDFn2c4SLczdPD8yjaePJF5ezCPqAkuVrfJDXMuhMFlvmexX
+y8gm0uOIJv3MhPlfMunkT0eHuu5WS5Xnqn0Cs9vDklOovopZTMOXnLM0IydpPl3beMIx8qo4ziU/Lsgglyrnl9Lsiks9W931DnJy
+znf1JwpLmewFZR2WWvcariKLjp++H+sj+TNtKOVlyWxqeI/7vW//ABF+TJWp65gAGGwAAAAAAAAAAAAAAAA3fCyi7uspPGaez9co
+0hueGMfO6uenh/xRYl8dK1KEZJ9corlxM3ixlHkn9Hs/IxunOEvNPo0aYMtRWzGdmtt0Q55fXZFvpQeSivLKKTxlEwS5ZPoiFtum
+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
+o4jLZbgVUOfeO3oRnHZIPK9xLktuZZb7+QVVJSe+Nyqbg35GRZjusSXmUzzZ6AV9mT2zH8iJ8ywmvZ813JT2cXleo3gsbNeQFU5P
+pvj0Dfmlll3BSWIPDXYx+HJPeDz7gJ5k48rWPcQ+XdZy/QLPRR3Evd0KQTePNeRMVBPO6fl2K58ujJlhrMe2wVLhPrjPqRKG2ZPl
+XqE3P2W8GOrJSljO0dkS1KmVZR2pr4sxSk5PMpNsnqyNmTabEsMkjAwEB2HQZALpgjq+mCQAGAAHcZI6DIRJDG77DEuuACHQLPck
+B7x0DIyUB0HXqAHUDbBOAIAwTggggs+pBFOwGBgCy6B9ckJ9g2EMjBGS8ablvLaPmVdJoRy+fsiWpPrsWk+ZLw3ypdg6lZLMnsVq
+KLdYayXiptY5PiR4lSXSWPcQ5Ta3k3gosoJZ55Jei7jn5ViCx6kNZe0cMOMumFj3gg2289Sz6dVjyIey6pBuKxu5PyCpjFP2pP2R
+JufTaKXQq5czWz2ITeGkvUiLPL6ILl7rLIy0sENtb9xBO76vfyIkl2XUOTaylv0LRpycczxBevVlVjx08zLTVaG6k4r16Ec8Y55F
+/wB3dkLLzKTyl0z5gey3cZLL5ebzRS6ksLdrtsYZNwUI5xJ7smm/F54Te67gYvC5+k+Yjw3Frmi1gn63LJYcdhmceknggNprdZ7E
+cqe3QlTW3NFMtKMFLCbi/Xcopsuknk1nETT09N9fEj+TNpOnNLKSa9DU8Qt/MMPrzx/Jkqz1zQAMNgAAAAAAAAAAAAAAABt+Hf2m
+r9n/ABRqDb8OLNzV+z/iixL46DG4WScMZyjTiLb1RbGSEvMtgimDNbW/i1Mv6K6mOEXUkox6tnuqNWtFQjvJjaxgva3O/Cj9FdTz
+OJkUW/eS4+fUgz8rlCCXXlJnTTccvfBeEsUYpJ7rcu4Lki0vQDFGns+jWC1KcoL2enqWpQaqejTKqOHh5+A2jI6aq/Q+l3iYvDk2
+1yteZlpxaUmljbYvJ+LBRqNrHdDYxKjLzivewqTWWpReVjqJ0PDa5uj6PzKcudkti7CUJRhlrBVKL3fUyc0oR9mWY9yFJN+1Bb+R
+Rj5eVNx2KtRk8tcr80ZWlF45mmY508LHNlhVJU2vVPuiM5WPIluSeU+ok01mSx6oIq3vmPRbjnmn9J4e5GHjCaYSljOOhWlvEysT
+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
+/ll/UfpG9/8A3lz/APLL+p5wBneoXkk07u5afZ1Zf1MLk28ttv3kABzP1HM/UABl+bGWAAyMgAMsZYADIywAG/mVnCNRYnGMkt/a
+WSwAx/N6H+DT/wBCHzeh/g0/9CMgAx/N6H+DT/0IfN6H+DT/ANCMgBtj+b0P8Gn/AKEPm9D/AAaf+hGQA2x/N6H+DT/0IfN6H+DT
+/wBCMgBsAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAB/9k=
+"""
+
+def _ensure_fon():
+    # Если рядом есть настоящий fon.jpg - берём его. Иначе разворачиваем
+    # вшитую копию в папку данных и используем её.
+    _p = _find_asset("fon.jpg")
+    if os.path.isfile(_p):
+        return _p
+    try:
+        import base64 as _b64
+        _out = os.path.join(BASE_DIR, "fon.jpg")
+        with open(_out, "wb") as _f:
+            _f.write(_b64.b64decode(FON_B64))
+        return _out
+    except Exception as _e:
+        print("Не удалось развернуть вшитый фон:", _e)
+        return _p
+
+FON_FILE = _ensure_fon()  # картинка-фон главной (файл или вшитая копия)
+
+# =====================================================================
+#  ЭМБЛЕМА ЖСК "КЛЕН" — вшита прямо в код, отдельный файл не нужен.
+#  (если рядом положить logo_mark.png, будет использован он)
+# =====================================================================
+LOGO_B64 = """
+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
+bWio4y7e2Eaq3Hbl95njdXOPM9B5HB9+8JYCZ3Udn63cogxDtQo8Vl98C3JJCPX3HEZ1VR2C5SZxtE/eXufo9GGskoejypU3BNUT
+XQJ9PIlFLDQ0Pt/frKgx08rGqHKsa4/zqJ/ATgQFpJlijNphqwAKOvcY+ExuE+FNZL7aLKCfWJtlFhMUSNqpJSp3yHCkGg/c+odp
+qq+DUs5DiO6JlDHDy+DHSmUkSdpTfTClBvvOCoKDLkqCpLrSIcOiml0xyjGUCCkHAwmYYJ8YwwBPMBuYTY0GksdSxUM+zb0NY7Si
+ClaTHERTz05jH1hVZXp+Q0wl1CI0CZEMw5d6n9qjgnTSGuOMukUYRP7XLX9J/vhn36RehDK+P7kMJ8jXjVfDj42tTwSmlf28vmEv
+BqNJNsnFu+WKzJleo2QH6xAB5GEGt9zxSV7b83v6ZB8Go0nx1muv5XV3ARu5qbgd1VWnyaH396O/r4dKzQ5SDbl8hXA1+E/3/yHa
+3n2D7Dl8kMMIJABcc7ODrG6Vs9GsTCbTWC2VaiNs0nQoIA91BcZQlTCBmKoKOn5llzm9Li2lemih8IsHCIKTA5idbiVG6g8A9ftT
+7rpfPobUMItlAdpsSDIcs2+3+BGJycX+VhOl6vOIQU+t8hjs2fWSJX+0wx8KyfQCgDhjo0ht8hMjBD6/F1WVtfjy7V//13uvuenr
+TOnJo/uI4YisrCUuDIK/+MUvxNTXX29b1ej/2buvfOFc5PXGyanwokBQDYOEE6hFBVAtF/DCEUesqRKVKiD6pryoAOhsoBqzIQlB
+35TyBsdDPsSZ2k3x0VlVSb/5J98YV3dzqO0jnx/dfae92p9vBrCmdUPG8c8NTWvx7c/+LXnk19+l6pCBEcj0stb5gI9lebXwqwfP
+M5d3ZlCiocAkGYwmFTXG2tqMwMcmN6tVHytufn+iD7X2JukTG5p5Vsen7vl96/Sg2FxRxW/ecdWk0S7gTO8fiwu+N+IfH+z8sCYa
+7ierW1oADIBKFlxx7adhc5SRVw91IX1XSExpw2NxQSM1yB6HTZru7+uhvmEvSUSqadRtIjZHAhxfAzhELKWpY24kYEI8IGK0a4jM
+Trca/k0sYqGAnHiLB/vTKKuFmvEkaZU4kCYBrlrZOCeJLuqqIingWdKAx3FuZHO7tWsKCn1vmAIUzHNxx3iAzHN5merLNh8wpxq/
+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
+4P8Bibjp8SsC/qwAAAAASUVORK5CYII=
+"""
+
+
+def _logo_image():
+    """Вернуть эмблему (PIL Image) из файла рядом или из вшитой копии."""
+    from PIL import Image
+    import base64, io
+    try:
+        if os.path.exists(LOGO_MARK):
+            return Image.open(LOGO_MARK).convert("RGBA")
+    except Exception as e:
+        print("Логотип из файла не открылся:", e)
+    try:
+        return Image.open(io.BytesIO(base64.b64decode(LOGO_B64))).convert("RGBA")
+    except Exception as e:
+        print("Вшитый логотип не открылся:", e)
+        return None
+PHOTO_DIR = os.path.join(BASE_DIR, "photo_archive")
+STAMP_DIR = os.path.join(BASE_DIR, "photo_stamped")
+THUMB_DIR = os.path.join(BASE_DIR, "photo_thumbs")
+
+try:
+    os.makedirs(PHOTO_DIR, exist_ok=True)
+    os.makedirs(STAMP_DIR, exist_ok=True)
+    os.makedirs(THUMB_DIR, exist_ok=True)
+    # .nomedia прячет папки приложения от галереи телефона,
+    # чтобы фото приложения не показывались в галерее и их нельзя было
+    # случайно удалить оттуда.
+    for _d in (PHOTO_DIR, STAMP_DIR, THUMB_DIR):
+        _nm = os.path.join(_d, ".nomedia")
+        if not os.path.exists(_nm):
+            open(_nm, "w").close()
+except Exception as _e:
+    print("Не удалось создать папку фото:", _e)
+
+# ---------------------------------------------------------------------
+#  ПАЛИТРА (тёмная, неоновые акценты)
+# ---------------------------------------------------------------------
+BG      = H("#0d0d12")   # фон
+CARD    = H("#1a1a24")   # карточка
+CARD2   = H("#22222e")   # карточка светлее
+BTN2    = H("#30313f")   # вторичная кнопка (заметно светлее фона)
+BORDER  = H("#5c5e7e")   # рамка вторичных кнопок
+ACCENT  = H("#00e5b0")   # неоновый бирюзовый (главное действие)
+ACCENT2 = H("#3aa0ff")   # синий (второе действие)
+DANGER  = H("#ff4d6d")   # красный (удалить/переснять)
+TEXT    = H("#f0f0f5")   # основной текст
+MUTED   = H("#8a8a9a")   # приглушённый текст
+DARKTX  = H("#0d0d12")   # тёмный текст на светлых кнопках
+INPUTBG = H("#1c1c26")   # фон полей ввода (НЕ прозрачный!)
+BACKC   = H("#8f7fe8")   # «назад» — свой цвет, чтобы не искать её глазами
+
+# =====================================================================
+#  БЛОК ANDROID: камера / поделиться / MMS
+#  Всё обёрнуто в try/except — если API недоступно, приложение
+#  продолжает работать, просто действие не выполняется.
+# =====================================================================
+
+# Съёмка через ШТАТНУЮ камеру напрямую (jnius + MediaStore), без plyer.
+# Почему так: plyer в Pydroid часто падает на file:// (FileUriExposedException).
+# MediaStore отдаёт content:// URI, в который камера пишет без FileProvider.
+# Готовое фото копируем в наш файл, а временную запись в галерее удаляем.
+
+def launch_native_camera(app, dest_path, on_done, status_cb):
+    """Запустить штатную камеру. Результат придёт в on_done(path|None)
+    через on_resume/опрос (см. методы приложения)."""
+    def report(m):
+        print("CAM:", m)
+        try:
+            status_cb(m)
+        except Exception:
+            pass
+
+    try:
+        from jnius import autoclass, cast
+    except Exception as e:
+        report("Модуль jnius недоступен: %s" % e)
+        on_done(None)
+        return
+
+    try:
+        PythonActivity = autoclass("org.kivy.android.PythonActivity")
+        activity = PythonActivity.mActivity
+        if activity is None:
+            report("Активность недоступна (mActivity=None)")
+            on_done(None)
+            return
+    except Exception as e:
+        report("Не найден PythonActivity: %s" % e)
+        on_done(None)
+        return
+
+    try:
+        Intent = autoclass("android.content.Intent")
+        MediaStore = autoclass("android.provider.MediaStore")
+        ContentValues = autoclass("android.content.ContentValues")
+        ImagesMedia = autoclass("android.provider.MediaStore$Images$Media")
+
+        resolver = activity.getContentResolver()
+        values = ContentValues()
+        values.put("_display_name", "photo_%d.jpg" % int(time.time()))
+        values.put("mime_type", "image/jpeg")
+        uri = resolver.insert(ImagesMedia.EXTERNAL_CONTENT_URI, values)
+        if uri is None:
+            report("Не удалось создать файл (uri=None). Нужны разрешения на фото.")
+            on_done(None)
+            return
+
+        intent = Intent(MediaStore.ACTION_IMAGE_CAPTURE)
+        intent.putExtra(MediaStore.EXTRA_OUTPUT, cast("android.os.Parcelable", uri))
+        intent.addFlags(Intent.FLAG_GRANT_WRITE_URI_PERMISSION)
+        intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+
+        app._cam = {"uri": uri, "dest": dest_path, "cb": on_done,
+                    "activity": activity, "tries": 0}
+        report("Открываю камеру...")
+        activity.startActivity(intent)
+    except Exception as e:
+        report("Ошибка запуска камеры: %s" % e)
+        on_done(None)
+
+
+def finish_native_camera(activity, uri, dest_path):
+    """Скопировать снятое фото из MediaStore в наш файл. True при успехе.
+    После копирования удаляем временную запись из галереи."""
+    from jnius import autoclass
+
+    def _cleanup():
+        try:
+            activity.getContentResolver().delete(uri, None, None)
+        except Exception as e:
+            print("CAM cleanup:", e)
+
+    # Способ 1: путь из столбца _data (характерно для старых Android)
+    try:
+        resolver = activity.getContentResolver()
+        cursor = resolver.query(uri, None, None, None, None)
+        if cursor is not None:
+            got = False
+            if cursor.moveToFirst():
+                idx = cursor.getColumnIndex("_data")
+                if idx >= 0:
+                    path = cursor.getString(idx)
+                    if path and os.path.exists(path) and os.path.getsize(path) > 0:
+                        shutil.copyfile(path, dest_path)
+                        got = True
+            cursor.close()
+            if got:
+                _cleanup()
+                return True
+    except Exception as e:
+        print("CAM _data:", e)
+
+    # Способ 2: чтение потока content:// (новые Android)
+    try:
+        resolver = activity.getContentResolver()
+        istream = resolver.openInputStream(uri)
+        if istream is None:
+            return False
+        FileOutputStream = autoclass("java.io.FileOutputStream")
+        out = FileOutputStream(dest_path)
+        buf = bytearray(8192)
+        total = 0
+        while True:
+            n = istream.read(buf)
+            if n <= 0:
+                break
+            out.write(buf, 0, n)
+            total += n
+        out.flush()
+        out.close()
+        istream.close()
+        if total > 0:
+            _cleanup()
+            return True
+        return False
+    except Exception as e:
+        print("CAM stream:", e)
+        return False
+
+
+def make_shareable_uri(activity, path):
+    """Скопировать фото в MediaStore и вернуть content:// URI, пригодный для
+    передачи в другие приложения (без FileProvider). None при ошибке.
+    Нужно потому, что на Android 7+ file:// нельзя отдавать другим приложениям."""
+    try:
+        from jnius import autoclass
+        ContentValues = autoclass("android.content.ContentValues")
+        ImagesMedia = autoclass("android.provider.MediaStore$Images$Media")
+        FileInputStream = autoclass("java.io.FileInputStream")
+        resolver = activity.getContentResolver()
+        values = ContentValues()
+        values.put("_display_name", "send_%d.jpg" % int(time.time()))
+        values.put("mime_type", "image/jpeg")
+        uri = resolver.insert(ImagesMedia.EXTERNAL_CONTENT_URI, values)
+        if uri is None:
+            return None
+        ostream = resolver.openOutputStream(uri)
+        istream = FileInputStream(path)
+        buf = bytearray(8192)
+        while True:
+            n = istream.read(buf)
+            if n <= 0:
+                break
+            ostream.write(buf, 0, n)
+        ostream.flush()
+        ostream.close()
+        istream.close()
+        return uri
+    except Exception as e:
+        print("make_shareable_uri:", e)
+        return None
+
+
+def share_photo(path):
+    """Открыть системное 'Поделиться' с прикреплённым фото (для MAX и др.).
+    True, если окно отправки открылось."""
+    try:
+        from jnius import autoclass, cast
+        PythonActivity = autoclass("org.kivy.android.PythonActivity")
+        activity = PythonActivity.mActivity
+        Intent = autoclass("android.content.Intent")
+        String = autoclass("java.lang.String")
+
+        uri = make_shareable_uri(activity, path)
+        if uri is None:
+            print("share: uri None")
+            return False
+
+        intent = Intent()
+        intent.setAction(Intent.ACTION_SEND)
+        intent.setType("image/*")
+        intent.putExtra(Intent.EXTRA_STREAM, cast("android.os.Parcelable", uri))
+        intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+
+        title = cast("java.lang.CharSequence", String("Отправить через"))
+        chooser = Intent.createChooser(intent, title)
+        chooser.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        activity.startActivity(chooser)
+        return True
+    except Exception as e:
+        print("Поделиться недоступно:", e)
+        return False
+
+
+@mainthread
+def _toast_main(msg):
+    toast(msg)
+
+
+def share_photos_multiple(paths):
+    """Отправить несколько фото. Тяжёлое копирование — в вызывающем потоке,
+    запуск окна отправки — на главном потоке."""
+    try:
+        from jnius import autoclass
+        PythonActivity = autoclass("org.kivy.android.PythonActivity")
+        activity = PythonActivity.mActivity
+        uris = []
+        for p in paths:
+            u = make_shareable_uri(activity, p)
+            if u is not None:
+                uris.append(u)
+        if not uris:
+            _toast_main("Не удалось подготовить фото.")
+            return False
+        _start_share_multiple(activity, uris)
+        return True
+    except Exception as e:
+        print("share multiple:", e)
+        _toast_main("Не удалось открыть отправку.")
+        return False
+
+
+@mainthread
+def _start_share_multiple(activity, uris):
+    try:
+        from jnius import autoclass, cast
+        Intent = autoclass("android.content.Intent")
+        String = autoclass("java.lang.String")
+        ArrayList = autoclass("java.util.ArrayList")
+
+        arr = ArrayList()
+        for u in uris:
+            arr.add(cast("android.os.Parcelable", u))
+
+        intent = Intent()
+        intent.setAction(Intent.ACTION_SEND_MULTIPLE)
+        intent.setType("image/*")
+        intent.putParcelableArrayListExtra(Intent.EXTRA_STREAM, arr)
+        intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+
+        title = cast("java.lang.CharSequence", String("Отправить"))
+        chooser = Intent.createChooser(intent, title)
+        chooser.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        activity.startActivity(chooser)
+    except Exception as e:
+        print("start share multiple:", e)
+        _toast_main("Не удалось открыть отправку.")
+
+
+def send_mms_multiple(paths, number):
+    """Отправить несколько фото по MMS на номер (копирование в фоне)."""
+    try:
+        from jnius import autoclass
+        PythonActivity = autoclass("org.kivy.android.PythonActivity")
+        activity = PythonActivity.mActivity
+        uris = []
+        for p in paths:
+            u = make_shareable_uri(activity, p)
+            if u is not None:
+                uris.append(u)
+        if not uris:
+            _toast_main("Не удалось подготовить фото.")
+            return False
+        _start_mms_multiple(activity, uris, number)
+        return True
+    except Exception as e:
+        print("mms multiple:", e)
+        _toast_main("Не удалось открыть отправку.")
+        return False
+
+
+@mainthread
+def _start_mms_multiple(activity, uris, number):
+    try:
+        from jnius import autoclass, cast
+        Intent = autoclass("android.content.Intent")
+        ArrayList = autoclass("java.util.ArrayList")
+
+        arr = ArrayList()
+        for u in uris:
+            arr.add(cast("android.os.Parcelable", u))
+
+        intent = Intent(Intent.ACTION_SEND_MULTIPLE)
+        intent.setType("image/*")
+        intent.putParcelableArrayListExtra(Intent.EXTRA_STREAM, arr)
+        intent.putExtra("address", number)
+        intent.putExtra("sms_body", "")
+        intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        try:
+            Telephony = autoclass("android.provider.Telephony$Sms")
+            pkg = Telephony.getDefaultSmsPackage(activity)
+            if pkg:
+                intent.setPackage(pkg)
+        except Exception as e:
+            print("MMS pkg:", e)
+        activity.startActivity(intent)
+    except Exception as e:
+        print("start mms multiple:", e)
+        _toast_main("Не удалось открыть отправку.")
+
+
+def send_mms(path, number):
+    """Открыть отправку фото через приложение сообщений (MMS) на номер.
+    На части устройств номер уже подставлен, на части — выбирается
+    в приложении сообщений (1 лишний тап). True, если отправка открылась."""
+    try:
+        from jnius import autoclass, cast
+        PythonActivity = autoclass("org.kivy.android.PythonActivity")
+        activity = PythonActivity.mActivity
+        Intent = autoclass("android.content.Intent")
+
+        uri = make_shareable_uri(activity, path)
+        if uri is None:
+            print("mms: uri None")
+            return False
+
+        intent = Intent(Intent.ACTION_SEND)
+        intent.setType("image/*")
+        intent.putExtra(Intent.EXTRA_STREAM, cast("android.os.Parcelable", uri))
+        intent.putExtra("address", number)
+        intent.putExtra("sms_body", "")
+        intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+
+        # Направить сразу в приложение сообщений по умолчанию
+        try:
+            Telephony = autoclass("android.provider.Telephony$Sms")
+            pkg = Telephony.getDefaultSmsPackage(activity)
+            if pkg:
+                intent.setPackage(pkg)
+        except Exception as e:
+            print("MMS default pkg:", e)
+
+        activity.startActivity(intent)
+        return True
+    except Exception as e:
+        print("MMS недоступно:", e)
+        return False
+
+# =====================================================================
+#  БЛОК ГЕОЛОКАЦИИ: чтение GPS из EXIF + адрес по координатам
+#  Полностью необязательный. Нет геометки/интернета — просто ничего
+#  не показываем, приложение работает как обычно.
+# =====================================================================
+
+def read_gps(path):
+    """Прочитать (lat, lon) из EXIF снимка. Вернуть None, если нет."""
+    try:
+        from PIL import Image as PILImage
+        from PIL.ExifTags import TAGS, GPSTAGS
+        img = PILImage.open(path)
+        exif = img._getexif()
+        if not exif:
+            return None
+        gps_raw = None
+        for tag, val in exif.items():
+            if TAGS.get(tag) == "GPSInfo":
+                gps_raw = val
+                break
+        if not gps_raw:
+            return None
+        gps = {}
+        for k, v in gps_raw.items():
+            gps[GPSTAGS.get(k, k)] = v
+        if "GPSLatitude" not in gps or "GPSLongitude" not in gps:
+            return None
+
+        def to_deg(v):
+            d = float(v[0]); m = float(v[1]); s = float(v[2])
+            return d + m / 60.0 + s / 3600.0
+
+        lat = to_deg(gps["GPSLatitude"])
+        lon = to_deg(gps["GPSLongitude"])
+        if str(gps.get("GPSLatitudeRef", "N")).upper() == "S":
+            lat = -lat
+        if str(gps.get("GPSLongitudeRef", "E")).upper() == "W":
+            lon = -lon
+        return (lat, lon)
+    except Exception as e:
+        print("EXIF/GPS ошибка:", e)
+        return None
+
+
+def reverse_geocode(lat, lon):
+    """Координаты -> адрес (нужен интернет). Вернуть строку или None."""
+    try:
+        import urllib.request
+        import json as _json
+        url = ("https://nominatim.openstreetmap.org/reverse?"
+               "format=json&lat=%s&lon=%s&zoom=18&addressdetails=1" % (lat, lon))
+        req = urllib.request.Request(url, headers={"User-Agent": "PhotoSender/1.0"})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = _json.loads(resp.read().decode("utf-8"))
+        return data.get("display_name")
+    except Exception as e:
+        print("Геокодер ошибка:", e)
+        return None
+
+
+# =====================================================================
+#  ПОДПИСЬ НА ФОТО: впечатываем текст в нижнюю часть снимка, чтобы
+#  получатель видел подпись прямо на картинке.
+# =====================================================================
+
+def _find_font(bold=False):
+    candidates = []
+    name = "Roboto-Bold.ttf" if bold else "Roboto-Regular.ttf"
+    try:
+        import kivy
+        candidates.append(os.path.join(os.path.dirname(kivy.__file__),
+                                       "data", "fonts", name))
+        candidates.append(os.path.join(os.path.dirname(kivy.__file__),
+                                       "data", "fonts", "Roboto-Regular.ttf"))
+    except Exception:
+        pass
+    if bold:
+        candidates += ["/system/fonts/Roboto-Bold.ttf",
+                       "/system/fonts/DroidSans-Bold.ttf",
+                       "/system/fonts/NotoSans-Bold.ttf"]
+    candidates += [
+        "/system/fonts/Roboto-Regular.ttf",
+        "/system/fonts/DroidSans.ttf",
+        "/system/fonts/NotoSans-Regular.ttf",
+    ]
+    for c in candidates:
+        if os.path.exists(c):
+            return c
+    return None
+
+
+# Одновременно готовим только одно фото — иначе на больших снимках
+# телефон упирается в память и всё виснет.
+STAMP_LOCK = threading.Lock()
+
+
+def stamped_cache_path(src_path, caption, comment="", meter=""):
+    """Имя файла-кэша для конкретного фото с конкретными надписями."""
+    try:
+        lg = "el2"
+        key = "%s|%s|%s|%s|%s" % (os.path.basename(src_path or ""), caption or "",
+                                  comment or "", meter or "", lg)
+        h = 0
+        for ch in key:
+            h = (h * 131 + ord(ch)) & 0xFFFFFFFF
+        return os.path.join(STAMP_DIR, "st_%08x.jpg" % h)
+    except Exception:
+        return None
+
+
+def stamped_ready(src_path, caption, comment="", meter=""):
+    """Готовое фото с надписями, если оно уже есть в кэше. Иначе None."""
+    if not caption and not comment and not meter:
+        return src_path if (src_path and os.path.exists(src_path)) else None
+    p = stamped_cache_path(src_path, caption, comment, meter)
+    return p if (p and os.path.exists(p)) else None
+
+
+def stamped_image_path(src_path, caption, comment="", meter=""):
+    """Фото с фирменной плашкой ЖСК: сверху поле с логотипом и адресом,
+    снизу поле с комментарием. Сам кадр ничем не перекрывается.
+    Результат кэшируется — повторные открытия мгновенные."""
+    if ((not caption and not comment and not meter) or not src_path
+            or not os.path.exists(src_path)):
+        return src_path
+
+    out = stamped_cache_path(src_path, caption, comment, meter)
+    if out and os.path.exists(out):
+        return out
+
+    with STAMP_LOCK:
+        # ещё раз проверяем: пока ждали очереди, файл мог уже появиться
+        if out and os.path.exists(out):
+            return out
+        return _render_stamped(src_path, caption, comment, out, meter)
+
+
+def _render_stamped(src_path, caption, comment, out, meter=""):
+    try:
+        from PIL import (Image, ImageDraw, ImageFont, ImageOps,
+                         ImageFilter, ImageChops)
+
+        GOLD = (255, 214, 102)
+        BG = (18, 24, 38)
+        FIELD = (10, 14, 22)
+
+        base = Image.open(src_path)
+        try:
+            # draft — быстрое и лёгкое декодирование JPEG сразу в меньший размер
+            base.draft("RGB", (1200, 1200))
+        except Exception:
+            pass
+        try:
+            base = ImageOps.exif_transpose(base)
+        except Exception:
+            pass
+        base = base.convert("RGB")
+        # Ужимаем: на снимках 2000+px отрисовка плашки очень тяжёлая
+        base.thumbnail((1200, 1200), Image.LANCZOS)
+        W0, H0 = base.size
+
+        # поля сверху и снизу — кадр не перекрываем
+        top_f = int(W0 * 0.215)
+        bot_f = int(W0 * 0.28)
+        img = Image.new("RGB", (W0, H0 + top_f + bot_f), FIELD)
+        img.paste(base, (0, top_f))
+        W, H = img.size
+        draw = ImageDraw.Draw(img)
+
+        fpath = _find_font(bold=True)
+
+        def fit(text, maxw, start_size):
+            fs = start_size
+            while fs > 8:
+                f = (ImageFont.truetype(fpath, fs) if fpath
+                     else ImageFont.load_default())
+                b = draw.textbbox((0, 0), text, font=f)
+                if (b[2] - b[0]) <= maxw or not fpath:
+                    return f, b
+                fs -= 1
+            f = (ImageFont.truetype(fpath, 8) if fpath
+                 else ImageFont.load_default())
+            return f, draw.textbbox((0, 0), text, font=f)
+
+        sx = 2
+        m = int(W * 0.012)
+        bw = max(2, int(W * 0.005))
+
+        def plate(boxes):
+            """Нарисовать фигуру из скруглённых блоков: фон + жёлтый контур."""
+            big = Image.new("L", (W * sx, H * sx), 0)
+            bd = ImageDraw.Draw(big)
+            for (bx, r) in boxes:
+                bd.rounded_rectangle([bx[0]*sx, bx[1]*sx, bx[2]*sx, bx[3]*sx],
+                                     radius=int(r)*sx, fill=255)
+            mk = big.resize((W, H), Image.LANCZOS).point(
+                lambda v: 255 if v > 128 else 0)
+            ol = ImageChops.subtract(mk, mk.filter(ImageFilter.MinFilter(bw*2+1)))
+            img.paste(Image.new("RGB", (W, H), BG), (0, 0), mk)
+            img.paste(Image.new("RGB", (W, H), GOLD), (0, 0), ol)
+
+        # ---- верхняя плашка: одна рамка, слева эмблема,
+        #      справа ЖСК КЛЕН, улица и дом/кв ----
+        if caption:
+            ph = int(W * 0.20)
+            x0, y0 = m, m
+            x1 = W - m
+            y1 = y0 + ph
+            plate([([x0, y0, x1, y1], ph * 0.24)])
+
+            pad = int(ph * 0.09)
+            mh = ph - pad * 2
+            mx = x0 + int(pad * 1.4)
+            text_x = x0 + int(pad * 1.4)
+            try:
+                mark = _logo_image()
+                if mark is not None:
+                    mw = max(1, int(mark.width * mh / mark.height))
+                    mark = mark.resize((mw, mh))
+                    img.paste(mark, (mx, y0 + pad), mark)
+                    text_x = mx + mw + pad
+            except Exception as le:
+                print("Эмблема не наложена:", le)
+
+            avail = x1 - text_x - int(pad * 1.4)
+
+            # Адрес двумя строками — так шрифт остаётся крупным
+            # даже на длинных улицах.
+            _st, _ho, _fl = parse_address(caption)
+            line1 = _st or caption
+            line2 = build_address("", _ho, _fl)
+
+            f_sm, b = fit("ЖСК КЛЕН", avail, int(ph * 0.15))
+            sw = b[2] - b[0]
+            draw.text((text_x + max(0, (avail - sw) // 2), y0 + int(ph * 0.07)),
+                      "ЖСК КЛЕН", fill=(255, 255, 255), font=f_sm)
+
+            if line2:
+                f1, b1 = fit(line1, avail, int(ph * 0.30))
+                w1 = b1[2] - b1[0]
+                draw.text((text_x + max(0, (avail - w1) // 2),
+                           y0 + int(ph * 0.29)), line1, fill=GOLD, font=f1)
+                f2, b2 = fit(line2, avail, int(ph * 0.30))
+                w2 = b2[2] - b2[0]
+                draw.text((text_x + max(0, (avail - w2) // 2),
+                           y0 + int(ph * 0.61)), line2, fill=GOLD, font=f2)
+            else:
+                f1, b1 = fit(line1, avail, int(ph * 0.34))
+                w1 = b1[2] - b1[0]
+                draw.text((text_x + max(0, (avail - w1) // 2),
+                           y0 + int(ph * 0.42)), line1, fill=GOLD, font=f1)
+
+        # ---- нижняя плашка: показания счётчика + комментарий ----
+        if True:
+            import re as _re2
+            _mt = meter or ""
+            _ct = comment or ""
+            _words = ("ХОЛОДНАЯ", "ГОРЯЧАЯ", "ЭЛЕКТРО")
+            _typ = ""
+            for _w in _words:
+                if _mt.startswith(_w):
+                    _typ = _w; break
+            if _typ == "ХОЛОДНАЯ":
+                _col = (77, 163, 255)
+            elif _typ == "ГОРЯЧАЯ":
+                _col = (255, 92, 92)
+            elif _typ == "ЭЛЕКТРО":
+                _col = (255, 214, 102)
+            else:
+                _col = (255, 255, 255)
+            _mm = _re2.search(r"(\d[\d ]*)\s*,\s*(\d+)", _mt)
+            _whole = ""; _frac = ""
+            if _mm:
+                _whole = _mm.group(1).replace(" ", ""); _frac = _mm.group(2)
+            else:
+                _mm2 = _re2.search(r"(\d+)", _mt)
+                if _mm2:
+                    _whole = _mm2.group(1)
+            _unit = "кВт·ч" if ("кВт" in _mt) else ("куб.м" if _whole else "")
+            _drawn = False
+            if _whole:
+                try:
+                    try:
+                        import datetime as _dt5, os as _os5
+                        _mns5 = ["", "ЯНВАРЬ", "ФЕВРАЛЬ", "МАРТ", "АПРЕЛЬ", "МАЙ", "ИЮНЬ", "ИЮЛЬ", "АВГУСТ", "СЕНТЯБРЬ", "ОКТЯБРЬ", "НОЯБРЬ", "ДЕКАБРЬ"]
+                        if src_path and _os5.path.exists(src_path):
+                            _dd5 = _dt5.datetime.fromtimestamp(_os5.path.getmtime(src_path))
+                        else:
+                            _dd5 = _dt5.datetime.now()
+                        _mon = _mns5[_dd5.month]
+                    except Exception:
+                        _mon = ""
+                    ch = int(W * 0.078); cw = int(W * 0.050); gap = int(W * 0.008)
+                    r2h = int(W * 0.062); pad = int(W * 0.022); midgap = int(W * 0.012)
+                    bw3 = max(2, int(W * 0.003))
+                    bh = pad + ch + midgap + r2h + pad
+                    by1 = H - m; by0 = by1 - bh
+                    plate([([m, by0, W - m, by1], int(bh * 0.14))])
+                    lx = m + int(W * 0.03)
+                    r1y = by0 + pad
+                    r2y = r1y + ch + midgap
+                    f_ty, _bty = fit(_typ or " ", int(W * 0.42), int(ch * 0.60))
+                    f_mn, _bmn = fit(_mon or " ", int(W * 0.42), int(r2h * 0.95))
+                    f_dig, _ = fit("8", int(cw * 0.8), int(ch * 0.58))
+                    f_un, _bu = fit(_unit or " ", int(W * 0.18), int(ch * 0.40))
+                    f_cm, _ = fit(_ct or " ", int(W * 0.60), int(r2h * 0.85))
+                    _tw = (draw.textbbox((0, 0), _typ, font=f_ty)[2]) if _typ else 0
+                    _mw = (draw.textbbox((0, 0), _mon, font=f_mn)[2]) if _mon else 0
+                    _lw = max(_tw, _mw)
+                    _rx0 = lx + _lw + int(W * 0.035)
+                    _rx1 = W - m - int(W * 0.015)
+                    if _typ:
+                        _bt = draw.textbbox((0, 0), _typ, font=f_ty)
+                        draw.text((lx, r1y + (ch - (_bt[3] - _bt[1])) // 2 - _bt[1]), _typ, fill=_col, font=f_ty)
+                    if _mon:
+                        _bm = draw.textbbox((0, 0), _mon, font=f_mn)
+                        draw.text((lx, r2y + (r2h - (_bm[3] - _bm[1])) // 2 - _bm[1]), _mon, fill=(255, 214, 102), font=f_mn)
+                    _uw = (_bu[2] - _bu[0]) if _unit else 0
+                    _bc = draw.textbbox((0, 0), ",", font=f_dig)
+                    _cmw = (_bc[2] - _bc[0]) + gap
+                    _n = len(_whole) + len(_frac)
+                    _rw = _n * cw + max(0, _n - 1) * gap + (_cmw if _frac else 0) + (_uw + gap if _unit else 0)
+                    x = _rx0 + max(0, (_rx1 - _rx0 - _rw) // 2)
+                    for _d in _whole:
+                        draw.rounded_rectangle([x, r1y, x + cw, r1y + ch], radius=int(cw * 0.16), fill=(28, 32, 42), outline=(150, 150, 170), width=bw3)
+                        _bd = draw.textbbox((0, 0), _d, font=f_dig)
+                        draw.text((x + (cw - (_bd[2] - _bd[0])) // 2 - _bd[0], r1y + (ch - (_bd[3] - _bd[1])) // 2 - _bd[1]), _d, fill=(255, 255, 255), font=f_dig)
+                        x += cw + gap
+                    if _frac:
+                        _bd = draw.textbbox((0, 0), ",", font=f_dig)
+                        draw.text((x, r1y + ch - (_bd[3] - _bd[1]) - int(ch * 0.10) - _bd[1]), ",", fill=(255, 255, 255), font=f_dig)
+                        x += _cmw
+                        for _d in _frac:
+                            draw.rounded_rectangle([x, r1y, x + cw, r1y + ch], radius=int(cw * 0.16), fill=(48, 24, 24), outline=(255, 92, 92), width=bw3)
+                            _bd = draw.textbbox((0, 0), _d, font=f_dig)
+                            draw.text((x + (cw - (_bd[2] - _bd[0])) // 2 - _bd[0], r1y + (ch - (_bd[3] - _bd[1])) // 2 - _bd[1]), _d, fill=(255, 92, 92), font=f_dig)
+                            x += cw + gap
+                    if _unit:
+                        _bd = draw.textbbox((0, 0), _unit, font=f_un)
+                        draw.text((x + gap, r1y + (ch - (_bd[3] - _bd[1])) // 2 - _bd[1]), _unit, fill=(210, 210, 220), font=f_un)
+                    if _ct:
+                        _bcm = draw.textbbox((0, 0), _ct, font=f_cm)
+                        _cx = _rx0 + max(0, (_rx1 - _rx0 - (_bcm[2] - _bcm[0])) // 2)
+                        draw.text((_cx, r2y + (r2h - (_bcm[3] - _bcm[1])) // 2 - _bcm[1]), _ct, fill=(200, 200, 210), font=f_cm)
+                    _drawn = True
+                except Exception:
+                    _drawn = False
+            if not _drawn:
+                try:
+                    import datetime as _dt6, os as _os6
+                    _mns6 = ["", "ЯНВАРЬ", "ФЕВРАЛЬ", "МАРТ", "АПРЕЛЬ", "МАЙ", "ИЮНЬ", "ИЮЛЬ", "АВГУСТ", "СЕНТЯБРЬ", "ОКТЯБРЬ", "НОЯБРЬ", "ДЕКАБРЬ"]
+                    if src_path and _os6.path.exists(src_path):
+                        _dd6 = _dt6.datetime.fromtimestamp(_os6.path.getmtime(src_path))
+                    else:
+                        _dd6 = _dt6.datetime.now()
+                    _mon6 = _mns6[_dd6.month]
+                except Exception:
+                    _mon6 = ""
+                _parts6 = []
+                if _mon6:
+                    _parts6.append(_mon6)
+                if _mt:
+                    _parts6.append(_mt)
+                if _ct:
+                    _parts6.append(_ct)
+                _txt = "   |   ".join(_parts6) if _parts6 else "-"
+                f_bt, b = fit(_txt, W - 2 * m - int(W * 0.06), int(W * 0.062))
+                lwid, lhei = b[2] - b[0], b[3] - b[1]
+                bh = lhei + int(W * 0.05)
+                by1 = H - m; by0 = by1 - bh
+                plate([([m, by0, W - m, by1], bh * 0.38)])
+                _y6 = by0 + (bh - lhei) // 2 - int(W * 0.007)
+
+                def _wid6(_s6):
+                    try:
+                        return int(draw.textlength(_s6, font=f_bt))
+                    except Exception:
+                        _bb6 = draw.textbbox((0, 0), _s6, font=f_bt)
+                        return _bb6[2] - _bb6[0]
+
+                _cols6 = []
+                if _mon6:
+                    _cols6.append((_mon6, (255, 214, 102)))
+                if _mt:
+                    _cols6.append((_mt, _col))
+                if _ct:
+                    _cols6.append((_ct, (200, 200, 210)))
+                if _cols6:
+                    _x6 = (W - _wid6(_txt)) // 2
+                    for _i6, _pc6 in enumerate(_cols6):
+                        if _i6:
+                            draw.text((_x6, _y6), "   |   ",
+                                      fill=(150, 150, 165), font=f_bt)
+                            _x6 += _wid6("   |   ")
+                        draw.text((_x6, _y6), _pc6[0], fill=_pc6[1], font=f_bt)
+                        _x6 += _wid6(_pc6[0])
+                else:
+                    draw.text(((W - lwid) // 2, _y6), _txt,
+                              fill=(255, 255, 255), font=f_bt)
+
+        # Вписываем всё в квадрат. Мессенджер показывает квадратное
+        # превью целиком, а вытянутое режет сверху и снизу — вместе
+        # с адресом и комментарием. Сам кадр не обрезается,
+        # получатель откроет фото и увеличит пальцами.
+        side = max(W, H)
+        square = Image.new("RGB", (side, side), FIELD)
+        square.paste(img, ((side - W) // 2, (side - H) // 2))
+        img = square
+
+        if not out:
+            out = os.path.join(STAMP_DIR, "stamp_%d.jpg" % int(time.time() * 1000))
+        img.save(out, "JPEG", quality=90)
+        return out
+    except Exception as e:
+        print("Не удалось наложить плашку:", e)
+        return src_path
+
+
+# --- Миниатюры для быстрого архива ---
+
+def cached_thumb_path(src):
+    """Путь к готовой миниатюре, если она уже создана. Иначе None."""
+    if not src:
+        return None
+    tp = os.path.join(THUMB_DIR, os.path.basename(src))
+    return tp if os.path.exists(tp) else None
+
+
+def make_thumb(src):
+    """Создать маленькую миниатюру (кэш). Вернуть путь или None."""
+    try:
+        if not src or not os.path.exists(src):
+            return None
+        tp = os.path.join(THUMB_DIR, os.path.basename(src))
+        if os.path.exists(tp):
+            return tp
+        from PIL import Image, ImageOps
+        with STAMP_LOCK:
+            if os.path.exists(tp):
+                return tp
+            img = Image.open(src)
+            try:
+                img.draft("RGB", (480, 480))
+            except Exception:
+                pass
+            try:
+                img = ImageOps.exif_transpose(img)
+            except Exception:
+                pass
+            img = img.convert("RGB")
+            img.thumbnail((240, 240))
+            img.save(tp, "JPEG", quality=80)
+        return tp
+    except Exception as e:
+        print("Не удалось создать миниатюру:", e)
+        return None
+
+# =====================================================================
+#  ДАННЫЕ
+# =====================================================================
+
+def default_data():
+    return {
+        "recipients": [],          # [{"name": "Олег", "number": "+7..."}]
+        "last_recipient": 0,       # индекс последнего адресата MMS
+        "settings": {"mms_mode": "list"},  # "list" | "last"
+        "default_address": "",     # адрес по умолчанию (подставляется в новые фото)
+        "archive": [],             # список записей архива
+    }
+
+
+def load_data():
+    if os.path.exists(DATA_FILE):
+        try:
+            with open(DATA_FILE, "r", encoding="utf-8") as f:
+                d = json.load(f)
+            base = default_data()
+            base.update(d)
+            if "settings" not in d:
+                base["settings"] = {"mms_mode": "list"}
+            return base
+        except Exception as e:
+            print("Ошибка чтения данных:", e)
+    return default_data()
+
+
+def save_data(data):
+    try:
+        with open(DATA_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print("Ошибка записи данных:", e)
+
+# =====================================================================
+#  UI-ХЕЛПЕРЫ
+# =====================================================================
+
+class RoundedButton(Button):
+    """Кнопка со скруглённым цветным фоном (без картинок).
+    border — цвет рамки (для тёмных кнопок, чтобы читались как кнопки)."""
+    def __init__(self, bg=ACCENT, fg=DARKTX, radius=20, border=None, **kw):
+        super().__init__(**kw)
+        self.background_normal = ""
+        self.background_down = ""
+        self.background_color = (0, 0, 0, 0)
+        self.color = fg
+        self.halign = "center"
+        self.valign = "middle"
+        self.bold = True
+        self._radius = radius
+        with self.canvas.before:
+            self._col = Color(*bg)
+            self._rect = RoundedRectangle(radius=[radius])
+            if border is not None:
+                self._bcol = Color(*border)
+                self._line = Line(width=2.4)
+            else:
+                self._line = None
+        self.bind(pos=self._upd, size=self._upd)
+
+    def _upd(self, *a):
+        self._rect.pos = self.pos
+        self._rect.size = self.size
+        if self._line is not None:
+            self._line.rounded_rectangle = (
+                self.x, self.y, self.width, self.height, self._radius)
+        self.text_size = (self.width - dp(16), None)
+
+    def set_bg(self, color):
+        self._col.rgba = color
+
+
+class ImageButton(ButtonBehavior, Image):
+    """Картинка, на которую можно нажимать (для миниатюр архива)."""
+    pass
+
+
+class Card(BoxLayout):
+    """Скруглённый контейнер-карточка (border — цвет рамки, если нужен)."""
+    def __init__(self, bg=CARD, radius=18, border=None, **kw):
+        super().__init__(**kw)
+        self._radius = radius
+        with self.canvas.before:
+            self._col = Color(*bg)
+            self._rect = RoundedRectangle(radius=[radius])
+            if border is not None:
+                self._bc = Color(*border)
+                self._ln = Line(width=1.6)
+            else:
+                self._ln = None
+        self.bind(pos=self._upd, size=self._upd)
+
+    def _upd(self, *a):
+        self._rect.pos = self.pos
+        self._rect.size = self.size
+        if self._ln is not None:
+            self._ln.rounded_rectangle = (
+                self.x, self.y, self.width, self.height, self._radius)
+
+
+def title_label(text, color=TEXT, size="20sp"):
+    lb = Label(text=text, color=color, font_size=size, bold=True,
+               size_hint_y=None, height=dp(48), halign="center", valign="middle")
+    lb.bind(size=lambda w, *a: setattr(w, "text_size", w.size))
+    return lb
+
+
+def body_label(text, color=MUTED, size="14sp", h=dp(26), halign="left"):
+    lb = Label(text=text, color=color, font_size=size,
+               size_hint_y=None, height=h, halign=halign, valign="middle")
+    lb.bind(size=lambda w, *a: setattr(w, "text_size", (w.width, None)))
+    return lb
+
+
+def make_input(hint=""):
+    """Поле ввода с ТЁМНЫМ НЕ прозрачным фоном (прозрачный ломает ввод
+    в Pydroid). Enter убирает клавиатуру, чтобы она не закрывала кнопки."""
+    ti = TextInput(
+        hint_text=hint, multiline=False,
+        background_color=INPUTBG, foreground_color=TEXT,
+        cursor_color=ACCENT, hint_text_color=(0.72, 0.76, 0.84, 1),
+        padding=[dp(12), dp(12)], font_size="17sp",
+        size_hint_y=None, height=dp(52),
+    )
+
+    from kivy.graphics import Color as _IC8, Line as _IL8
+
+    def _bord8(*_a):
+        ti.canvas.after.clear()
+        with ti.canvas.after:
+            _IC8(ACCENT[0], ACCENT[1], ACCENT[2], 0.85)
+            _IL8(rounded_rectangle=(ti.x + 1, ti.y + 1,
+                                    ti.width - 2, ti.height - 2, dp(9)),
+                 width=1.6)
+
+    ti.bind(pos=_bord8, size=_bord8)
+    ti.bind(on_text_validate=lambda w: setattr(w, "focus", False))
+    return ti
+
+
+def parse_address(text):
+    """Разобрать адрес на (улица, дом, кв)."""
+    street, house, flat = (text or "").strip(), "", ""
+    low = street.lower()
+    for key in (" дом", " д.", " д "):
+        i = low.find(key)
+        if i > 0:
+            rest = street[i + len(key):].strip()
+            street = street[:i].strip()
+            low2 = rest.lower()
+            j = -1
+            for k2 in ("кв.", "кв ", "кв"):
+                j = low2.find(k2)
+                if j >= 0:
+                    flat = rest[j + len(k2):].strip()
+                    rest = rest[:j].strip()
+                    break
+            house = rest.strip()
+            break
+    return street, house, flat
+
+
+def build_address(street, house, flat):
+    """Собрать адрес из частей."""
+    street = (street or "").strip()
+    house = (house or "").strip()
+    flat = (flat or "").strip()
+    out = street
+    if house:
+        out += (" " if out else "") + "дом " + house
+    if flat:
+        out += (" " if out else "") + "кв " + flat
+    return out.strip()
+
+
+def make_digit_cell(bg=INPUTBG, fg=TEXT):
+    """Ячейка под одну цифру счётчика."""
+    ti = TextInput(
+        text="", multiline=False, halign="center",
+        background_color=bg, foreground_color=fg,
+        cursor_color=ACCENT, padding=[0, dp(10)],
+        font_size="17sp", input_type="number",
+        size_hint_x=None, width=dp(33),
+    )
+    return ti
+
+def _ster_btn(inp):
+    """Кнопка СТЕР — очищает поле inp."""
+    b = RoundedButton(text="СТЕР", bg=BTN2, fg=TEXT,
+                      border=BORDER, size_hint_x=None,
+                      width=dp(64), font_size="10sp")
+    b.bind(on_release=lambda *a: setattr(inp, "text", ""))
+    return b
+
+
+def make_num_input(hint=""):
+    """Поле для цифр (клавиатура с числами)."""
+    ti = make_input(hint)
+    ti.input_type = "number"
+    return ti
+
+def meter_unit(mtype):
+    """Единицы измерения: у света киловатт-часы, у воды кубы."""
+    return "кВт\u00b7ч" if (mtype or "").strip() == "ЭЛЕКТРО" else "м3"
+
+
+def meter_slots(mtype):
+    """Сколько ячеек под цифры.
+    Вода: 5 целых и 3 красных (дробных).
+    Свет (ЭНЕРГОМЕРА CE101 и подобные): 5 целых и 1 красная."""
+    return (5, 1) if (mtype or "").strip() == "ЭЛЕКТРО" else (5, 3)
+
+
+def meter_line(mtype, mval):
+    """Строка про счётчик. Тип и цифры — каждое по желанию:
+    можно только «ХОЛОДНАЯ», можно с показаниями, можно ничего."""
+    t = (mtype or "").strip()
+    if t in ("ХВС", "ХОЛОДНАЯ"):
+        t = "ХОЛОДНАЯ"
+    elif t in ("ГВС", "ГОРЯЧАЯ"):
+        t = "ГОРЯЧАЯ"
+    elif t:
+        t = "ЭЛЕКТРО"
+    m = (mval or "").strip()
+    u = meter_unit(t)
+    if t and m:
+        return "%s  %s %s" % (t, m, u)
+    if t:
+        return t
+    if m:
+        return "%s %s" % (m, u)
+    return ""
+
+
+def meter_text(entry):
+    """Строка показаний счётчика для фото и карточек."""
+    return meter_line(entry.get("meter_type", ""), entry.get("meter", ""))
+
+def warm_entry(entry):
+    """Заранее перерисовать фото с плашкой после правки текста."""
+    f = entry.get("file", "")
+    if not f or not os.path.exists(f):
+        return
+    c1 = entry.get("caption", "")
+    c2 = entry.get("comment", "")
+    c3 = meter_text(entry)
+
+    def work():
+        try:
+            stamped_image_path(f, c1, c2, c3)
+        except Exception as ex:
+            print("warm_entry:", ex)
+    threading.Thread(target=work, daemon=True).start()
+
+def split_address(text):
+    """Разбить адрес на две строки: улица сверху, дом/кв снизу."""
+    if not text:
+        return ""
+    low = text.lower()
+    for key in (" дом", " д.", " д ", " корп", " стр"):
+        i = low.find(key)
+        if i > 0:
+            return text[:i].strip() + "\n" + text[i:].strip()
+    return text
+
+def toast(msg):
+    """Короткое всплывающее сообщение (само закроется)."""
+    lbl = Label(text=msg, color=TEXT, halign="center", valign="middle",
+                font_size="15sp")
+    lbl.bind(size=lambda w, *a: setattr(w, "text_size", w.size))
+    p = Popup(title="", content=lbl, size_hint=(0.85, None), height=dp(180),
+              separator_height=0, background_color=(0.05, 0.05, 0.07, 1))
+    p.open()
+    Clock.schedule_once(lambda dt: p.dismiss(), 2.6)
+
+
+def confirm_delete(msg, on_yes):
+    """Окно подтверждения удаления. on_yes() вызывается при согласии."""
+    content = BoxLayout(orientation="vertical", spacing=dp(14), padding=dp(16))
+    lbl = Label(text=msg, color=TEXT, font_size="16sp",
+                halign="center", valign="middle")
+    lbl.bind(size=lambda w, *a: setattr(w, "text_size", w.size))
+    content.add_widget(lbl)
+
+    p = Popup(title="", content=content, size_hint=(0.86, None), height=dp(230),
+              separator_height=0, background_color=(0.05, 0.05, 0.07, 1))
+    row = BoxLayout(size_hint_y=None, height=dp(66), spacing=dp(12))
+    no = RoundedButton(text="ОТМЕНА", bg=BTN2, fg=TEXT, border=BORDER, font_size="15sp")
+    no.bind(on_release=lambda *a: p.dismiss())
+    yes = RoundedButton(text="УДАЛИТЬ", bg=DANGER, fg=TEXT, font_size="15sp")
+
+    def do(*a):
+        p.dismiss()
+        on_yes()
+    yes.bind(on_release=do)
+    row.add_widget(no)
+    row.add_widget(yes)
+    content.add_widget(row)
+    p.open()
+
+def edit_meter_dialog(entry, on_done=None):
+    """Показания счётчика: сверху фото, снизу цифры — одновременно.
+    Фото увеличивается пальцами (до 8 раз) и двигается, поэтому можно
+    разглядеть цифру, тут же набрать её и сдвинуть фото дальше."""
+    content = BoxLayout(orientation="vertical", spacing=dp(6), padding=dp(8))
+
+    # --- фото сверху: берём оригинал, он чётче обработанного ---
+    src = entry.get("file", "")
+    frame = ZoomFrame()
+    im = frame.img
+    if src and os.path.exists(src):
+        im.source = _meter_upright(src)
+    else:
+        tp = cached_thumb_path(src)
+        if tp:
+            im.source = _meter_upright(tp)
+    content.add_widget(frame)
+
+    st = {"type": entry.get("meter_type", ""),
+          "digits": list((entry.get("meter", "") or "").replace(",", ""))}
+
+    # --- вода ---
+    trow = BoxLayout(size_hint_y=None, height=dp(42), spacing=dp(6))
+    b_cold = RoundedButton(text="ХОЛОДНАЯ", bg=BTN2, fg=TEXT, border=BORDER,
+                           font_size="11sp")
+    b_hot = RoundedButton(text="ГОРЯЧАЯ", bg=BTN2, fg=TEXT, border=BORDER,
+                          font_size="11sp")
+    b_el = RoundedButton(text="ЭЛЕКТРО", bg=BTN2, fg=TEXT, border=BORDER,
+                         font_size="11sp")
+
+    def paint_water():
+        b_cold.set_bg(H("#4da3ff") if st["type"] == "ХОЛОДНАЯ" else BTN2)
+        b_hot.set_bg(H("#ff5c5c") if st["type"] == "ГОРЯЧАЯ" else BTN2)
+        el = (st["type"] == "ЭЛЕКТРО")
+        b_el.set_bg(H("#ffd166") if el else BTN2)
+        b_el.color = DARKTX if el else TEXT
+        build_cells()
+
+    def set_type(t):
+        st["type"] = "" if st["type"] == t else t
+        paint_water()
+
+    b_cold.bind(on_press=lambda *a: set_type("ХОЛОДНАЯ"))
+    b_hot.bind(on_press=lambda *a: set_type("ГОРЯЧАЯ"))
+    b_el.bind(on_press=lambda *a: set_type("ЭЛЕКТРО"))
+    trow.add_widget(b_cold)
+    trow.add_widget(b_hot)
+    trow.add_widget(b_el)
+    content.add_widget(trow)
+
+    # --- ячейки под цифры ---
+    crow = BoxLayout(size_hint_y=None, height=dp(48), spacing=dp(2))
+    content.add_widget(crow)
+    st["cells"] = []
+
+    def build_cells():
+        """Ячейки под тип счётчика: у воды 5+3, у света 5+1.
+        Перестраиваются, когда переключаешь воду/свет."""
+        w_cnt, f_cnt = meter_slots(st["type"])
+        total = w_cnt + f_cnt
+        st["w_cnt"] = w_cnt
+        st["total"] = total
+        st["digits"] = st["digits"][:total]
+        crow.clear_widgets()
+        st["cells"] = []
+        crow.add_widget(Label(size_hint_x=1))
+        for i in range(total):
+            red = i >= w_cnt
+            cell = Card(bg=CARD2, border=(H("#ff6b6b") if red else BORDER),
+                        radius=5, orientation="vertical",
+                        size_hint_x=None, width=dp(30))
+            lb = Label(text="", color=(H("#ff6b6b") if red else TEXT),
+                       font_size="17sp", bold=True)
+            cell.add_widget(lb)
+            st["cells"].append(lb)
+            crow.add_widget(cell)
+            if i == w_cnt - 1:
+                crow.add_widget(Label(text=",", color=TEXT, font_size="17sp",
+                                      bold=True, size_hint_x=None,
+                                      width=dp(9)))
+        st["um"] = Label(text=meter_unit(st["type"]), color=MUTED,
+                         font_size="11sp", size_hint_x=None, width=dp(40))
+        crow.add_widget(st["um"])
+        crow.add_widget(Label(size_hint_x=1))
+        redraw()
+
+    def redraw():
+        for i, lb in enumerate(st["cells"]):
+            lb.text = st["digits"][i] if i < len(st["digits"]) else ""
+
+    def tap(d):
+        if len(st["digits"]) < st.get("total", 8):
+            st["digits"].append(d)
+            redraw()
+
+    def back(*a):
+        if st["digits"]:
+            st["digits"].pop()
+            redraw()
+
+    # --- клавиатура ---
+    keys = GridLayout(cols=3, size_hint_y=None, height=dp(170), spacing=dp(5))
+    for d in ["1", "2", "3", "4", "5", "6", "7", "8", "9"]:
+        k = RoundedButton(text=d, bg=CARD2, fg=TEXT, border=BORDER,
+                          font_size="19sp")
+        k.bind(on_press=lambda *a, dd=d: tap(dd))
+        keys.add_widget(k)
+    kc = RoundedButton(text="← СТЕРЕТЬ", bg=BTN2, fg=TEXT, border=BORDER,
+                       font_size="10sp")
+    kc.bind(on_press=back)
+    k0 = RoundedButton(text="0", bg=CARD2, fg=TEXT, border=BORDER,
+                       font_size="19sp")
+    k0.bind(on_press=lambda *a: tap("0"))
+    kd = RoundedButton(text="ОЧИСТИТЬ ВСЁ", bg=BTN2, fg=TEXT, border=BORDER,
+                       font_size="10sp")
+
+    def clear_digits(*a):
+        st["digits"] = []
+        redraw()
+    kd.bind(on_press=clear_digits)
+    keys.add_widget(kc)
+    keys.add_widget(k0)
+    keys.add_widget(kd)
+    content.add_widget(keys)
+
+    pp = Popup(title="Показания счётчика", content=content,
+               size_hint=(0.98, 0.96),
+               title_color=TEXT, separator_color=ACCENT,
+               background_color=(0.05, 0.05, 0.07, 1))
+
+    def save(*a):
+        ds = st["digits"]
+        whole = "".join(ds[:st.get("w_cnt", 5)])
+        frac = "".join(ds[st.get("w_cnt", 5):])
+        val = ""
+        if whole or frac:
+            val = (whole or "0") + ("," + frac if frac else "")
+        if val:
+            entry["meter"] = val
+        else:
+            entry.pop("meter", None)
+        if st["type"]:
+            entry["meter_type"] = st["type"]
+        else:
+            entry.pop("meter_type", None)
+        App.get_running_app().save()
+        warm_entry(entry)
+        pp.dismiss()
+        if on_done:
+            on_done()
+
+    def wipe(*a):
+        entry.pop("meter", None)
+        entry.pop("meter_type", None)
+        App.get_running_app().save()
+        warm_entry(entry)
+        pp.dismiss()
+        if on_done:
+            on_done()
+
+    row = BoxLayout(size_hint_y=None, height=dp(46), spacing=dp(8))
+    cl = RoundedButton(text="УБРАТЬ", bg=BTN2, fg=TEXT, border=BORDER,
+                       font_size="12sp")
+    cl.bind(on_press=wipe)
+    cn = RoundedButton(text="ОТМЕНА", bg=BTN2, fg=TEXT, border=BORDER,
+                       font_size="12sp")
+    cn.bind(on_press=lambda *a: pp.dismiss())
+    ok = RoundedButton(text="ГОТОВО", bg=ACCENT, fg=DARKTX, font_size="13sp")
+    ok.bind(on_press=save)
+    row.add_widget(cl)
+    row.add_widget(cn)
+    row.add_widget(ok)
+    content.add_widget(row)
+
+    build_cells()
+    paint_water()
+    pp.open()
+
+
+def logo_texture():
+    """Вшитый логотип как картинка для экрана.
+    Отдельный файл не нужен: берём из LOGO_B64 (или logo_mark.png,
+    если он положен рядом)."""
+    try:
+        from kivy.core.image import Image as CoreImage
+        import base64
+        import io
+        if os.path.exists(LOGO_MARK):
+            return CoreImage(LOGO_MARK).texture
+        data = io.BytesIO(base64.b64decode(LOGO_B64))
+        return CoreImage(data, ext="png").texture
+    except Exception as e:
+        print("Логотип на экран не встал:", e)
+        return None
+
+
+def logo_image(**kw):
+    """Готовый виджет с логотипом."""
+    im = Image(allow_stretch=True, keep_ratio=True, **kw)
+    tx = logo_texture()
+    if tx is not None:
+        im.texture = tx
+    return im
+
+
+# =====================================================================
+#  ЭКРАН 1: КАМЕРА (авто-запуск штатной камеры)
+# =====================================================================
+
+class CameraScreen(Screen):
+    def __init__(self, **kw):
+        super().__init__(**kw)
+
+        # Фон-картинка. Лежит рядом со скриптом — рисуем её,
+        # нет файла — остаётся обычный тёмный фон.
+        self._bg = None
+        if os.path.exists(FON_FILE):
+            with self.canvas.before:
+                Color(1, 1, 1, 1)
+                self._bg = Rectangle(source=FON_FILE, pos=self.pos,
+                                     size=self.size)
+            self.bind(pos=self._upd_bg, size=self._upd_bg)
+
+        root = BoxLayout(orientation="vertical", spacing=dp(10),
+                         padding=[dp(16), dp(12)])
+
+        # шапка-полоса: логотип и название
+        head = Card(bg=(0.05, 0.12, 0.16, 0.85), radius=12,
+                    orientation="horizontal", size_hint_y=None,
+                    height=dp(50), padding=[dp(10), dp(6)], spacing=dp(10))
+        head.add_widget(logo_image(size_hint_x=None, width=dp(30)))
+        cap = Label(text="ФОТО-ОТПРАВЩИК", color=TEXT, font_size="15sp",
+                    bold=True, halign="left", valign="middle")
+        cap.bind(size=lambda w, *a: setattr(w, "text_size", w.size))
+        head.add_widget(cap)
+        root.add_widget(head)
+
+        # Название кооператива — прямо на картинке, без подложки.
+        # Чтобы читалось на пёстром фоне, у букв чёрная обводка.
+        name = Label(text="ЖСК КЛЕН", color=H("#ffd166"), font_size="30sp",
+                     bold=True, size_hint_y=None, height=dp(48),
+                     halign="center", valign="middle",
+                     outline_width=2, outline_color=(0, 0, 0, 1))
+        name.bind(size=lambda w, *a: setattr(w, "text_size", w.size))
+        root.add_widget(name)
+
+        self.status = Label(
+            text="Нажмите «СНЯТЬ ФОТО», чтобы сделать снимок.",
+            color=(0.92, 0.92, 0.92, 1), font_size="13sp",
+            size_hint_y=None, height=dp(36),
+            halign="center", valign="middle",
+            outline_width=2, outline_color=(0, 0, 0, 1))
+        self.status.bind(size=lambda w, *a: setattr(w, "text_size", w.size))
+        root.add_widget(self.status)
+
+        # пусто: тут видно картинку
+        root.add_widget(Label(size_hint_y=1))
+
+        self.btn = RoundedButton(text="СНЯТЬ ФОТО", bg=ACCENT, fg=DARKTX,
+                                 size_hint_y=None, height=dp(64),
+                                 font_size="18sp")
+        self.btn.bind(on_release=lambda *a: self.launch())
+        root.add_widget(self.btn)
+
+        arch = RoundedButton(text="АРХИВ", bg=H("#3d4a63"), fg=TEXT,
+                             border=BORDER, size_hint_y=None, height=dp(56),
+                             font_size="16sp")
+        arch.bind(on_release=lambda *a: self.go_archive())
+        root.add_widget(arch)
+
+        ex = RoundedButton(text="ВЫХОД", bg=H("#e06a6a"), fg=TEXT,
+                           size_hint_y=None, height=dp(52), font_size="15sp")
+        ex.bind(on_release=lambda *a: self.exit_app())
+        root.add_widget(ex)
+
+        root.add_widget(body_label("ЖСК КЛЕН", color=(0.7, 0.7, 0.7, 1),
+                                   size="11sp", h=dp(20), halign="center"))
+
+        self.add_widget(root)
+
+    def _upd_bg(self, *a):
+        if self._bg is not None:
+            self._bg.pos = self.pos
+            self._bg.size = self.size
+
+    def exit_app(self):
+        app = App.get_running_app()
+        try:
+            from jnius import autoclass
+            activity = autoclass("org.kivy.android.PythonActivity").mActivity
+            activity.finishAndRemoveTask()
+        except Exception as e:
+            print("Выход:", e)
+        app.stop()
+
+    def on_enter(self, *a):
+        # Стартовая страница. Камера открывается по кнопке «СНЯТЬ ФОТО».
+        if not App.get_running_app()._cam:
+            self.status.text = "Нажмите «СНЯТЬ ФОТО», чтобы сделать снимок."
+
+    def launch(self):
+        app = App.get_running_app()
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        path = os.path.join(PHOTO_DIR, "photo_%s.jpg" % ts)
+        self.status.text = "Открываю камеру..."
+        app.launch_camera(path, self._done, self._set_status)
+
+    def _set_status(self, msg):
+        self.status.text = msg
+
+    def _done(self, path):
+        app = App.get_running_app()
+        if path and os.path.exists(path):
+            app.current_photo = path
+            self.status.text = ""
+            self.manager.transition.direction = "left"
+            self.manager.current = "review"
+        else:
+            self.status.text = ("Съёмка отменена или камера недоступна.\n"
+                                "Нажмите «СНЯТЬ ФОТО», чтобы попробовать снова.")
+
+    def go_archive(self):
+        self.manager.transition.direction = "left"
+        self.manager.current = "archive"
+
+
+# =====================================================================
+#  ЭКРАН 2: ПРОВЕРКА (Отправить / Переснять)
+# =====================================================================
+
+class ReviewScreen(Screen):
+    def __init__(self, **kw):
+        super().__init__(**kw)
+        root = BoxLayout(orientation="vertical", padding=dp(14), spacing=dp(10))
+        root.add_widget(title_label("ПРОВЕРКА СНИМКА", color=TEXT))
+
+        # Фото в рамке с зумом (два пальца) и значком-стрелками.
+        self._frame = ZoomFrame()
+        self.img = self._frame.img
+
+        # Хранилище значений (полей ввода на экране больше нет)
+        self.street_val = ""
+        self.house_val = ""
+        self.flat_val = ""
+        self.comment_val = ""
+        self.meter_type = ""
+        self.meter_data = ""
+
+        # --- Редкое: адрес и комментарий, каждый в своей рамке, мелко ---
+        # Читать тут не нужно: нажал ИЗМЕНИТЬ — в отдельном окне крупно.
+        abox = Card(bg=(1, 1, 1, 0.03), border=BORDER, radius=8,
+                    orientation="horizontal", size_hint_y=None, height=dp(32),
+                    padding=[dp(8), dp(2)], spacing=dp(6))
+        self.addr_lbl = Label(text="", color=H("#ffd166"), font_size="11sp",
+                              bold=True, halign="left", valign="middle")
+        self.addr_lbl.bind(size=lambda w, *a: setattr(w, "text_size", w.size))
+        ea = RoundedButton(text="ИЗМЕНИТЬ", bg=ACCENT2, fg=TEXT,
+                           size_hint_x=None, width=dp(88), font_size="9sp")
+        ea.bind(on_release=lambda *a: self.edit_address())
+        abox.add_widget(self.addr_lbl)
+        abox.add_widget(ea)
+        root.add_widget(abox)
+
+        cbox = Card(bg=(1, 1, 1, 0.03), border=BORDER, radius=8,
+                    orientation="horizontal", size_hint_y=None, height=dp(32),
+                    padding=[dp(8), dp(2)], spacing=dp(6))
+        self.com_lbl = Label(text="", color=MUTED, font_size="10sp",
+                             halign="left", valign="middle")
+        self.com_lbl.bind(size=lambda w, *a: setattr(w, "text_size", w.size))
+        ec = RoundedButton(text="ИЗМЕНИТЬ", bg=BTN2, fg=TEXT, border=BORDER,
+                           size_hint_x=None, width=dp(88), font_size="9sp")
+        ec.bind(on_release=lambda *a: self.edit_comment())
+        cbox.add_widget(self.com_lbl)
+        cbox.add_widget(ec)
+        root.add_widget(cbox)
+
+        # Фото — под адресом и комментарием,
+        # чтобы кнопки внизу оставались на виду.
+        root.add_widget(self._frame)
+        root.add_widget(body_label("Фото увеличивается двумя пальцами",
+                                   color=MUTED, size="11sp", h=dp(18),
+                                   halign="center"))
+
+        # --- Частое: тип счётчика ---
+        mrow = BoxLayout(size_hint_y=None, height=dp(46), spacing=dp(6))
+        self.b_cold = RoundedButton(text="ХОЛОДНАЯ", bg=BTN2, fg=TEXT,
+                                    border=BORDER, font_size="11sp")
+        self.b_cold.bind(on_press=lambda *a: self.pick_water("ХОЛОДНАЯ"))
+        self.b_hot = RoundedButton(text="ГОРЯЧАЯ", bg=BTN2, fg=TEXT,
+                                   border=BORDER, font_size="11sp")
+        self.b_hot.bind(on_press=lambda *a: self.pick_water("ГОРЯЧАЯ"))
+        self.b_el = RoundedButton(text="ЭЛЕКТРО", bg=BTN2, fg=TEXT,
+                                  border=BORDER, font_size="11sp")
+        self.b_el.bind(on_press=lambda *a: self.pick_water("ЭЛЕКТРО"))
+        mrow.add_widget(self.b_cold)
+        mrow.add_widget(self.b_hot)
+        mrow.add_widget(self.b_el)
+        root.add_widget(mrow)
+
+        keep = RoundedButton(text="СОХРАНИТЬ В АРХИВ", bg=ACCENT, fg=DARKTX,
+                             size_hint_y=None, height=dp(46), font_size="12sp")
+        keep.bind(on_release=lambda *a: self.save_only())
+        root.add_widget(keep)
+
+        # --- Частое: снизу. Главная — СОХРАНИТЬ (зелёная) ---
+        row1 = BoxLayout(size_hint_y=None, height=dp(52), spacing=dp(10))
+        retake = RoundedButton(text="ПЕРЕСНЯТЬ", bg=BTN2, fg=TEXT,
+                               border=BORDER, font_size="14sp")
+        retake.bind(on_release=lambda *a: self.retake())
+        self.meter_btn = RoundedButton(text="ПОКАЗАНИЯ", bg=BTN2, fg=TEXT,
+                                       border=BORDER, font_size="13sp")
+        self.meter_btn.bind(on_press=lambda *a: self.open_meter())
+        row1.add_widget(retake)
+        row1.add_widget(self.meter_btn)
+        root.add_widget(row1)
+
+        row2 = BoxLayout(size_hint_y=None, height=dp(52), spacing=dp(10))
+        back = RoundedButton(text="НАЗАД", bg=BACKC, fg=TEXT, border=None,
+                             font_size="14sp")
+        back.bind(on_release=lambda *a: self.go_back())
+        send = RoundedButton(text="ОТПРАВИТЬ", bg=ACCENT2, fg=TEXT,
+                             font_size="14sp")
+        send.bind(on_release=lambda *a: self.go_send())
+        row2.add_widget(back)
+        row2.add_widget(send)
+        root.add_widget(row2)
+
+        self.add_widget(root)
+
+    # ---------- счётчик ----------
+    def pick_water(self, t):
+        self.meter_type = "" if self.meter_type == t else t
+        self._upd_meter()
+
+    def _upd_meter(self):
+        self.b_cold.set_bg(H("#4da3ff") if self.meter_type == "ХОЛОДНАЯ"
+                           else BTN2)
+        self.b_cold.color = TEXT
+        self.b_hot.set_bg(H("#ff5c5c") if self.meter_type == "ГОРЯЧАЯ"
+                          else BTN2)
+        self.b_hot.color = TEXT
+        el = (self.meter_type == "ЭЛЕКТРО")
+        self.b_el.set_bg(H("#ffd166") if el else BTN2)
+        self.b_el.color = DARKTX if el else TEXT
+        if self.meter_data:
+            self.meter_btn.text = "%s %s" % (self.meter_data,
+                                             meter_unit(self.meter_type))
+            self.meter_btn.set_bg(ACCENT2)
+            self.meter_btn.color = TEXT
+        else:
+            self.meter_btn.text = "ПОКАЗАНИЯ"
+            self.meter_btn.set_bg(BTN2)
+            self.meter_btn.color = TEXT
+
+    def open_meter(self):
+        content = BoxLayout(orientation="vertical", spacing=dp(8),
+                            padding=dp(10))
+        w_cnt, f_cnt = meter_slots(self.meter_type)
+        total = w_cnt + f_cnt
+        st = {"digits": list((self.meter_data or "").replace(",", ""))[:total]}
+
+        crow = BoxLayout(size_hint_y=None, height=dp(54), spacing=dp(2))
+        crow.add_widget(Label(size_hint_x=1))
+        cells = []
+        for i in range(total):
+            red = i >= w_cnt
+            cell = Card(bg=CARD2, border=(H("#ff6b6b") if red else BORDER),
+                        radius=5, orientation="vertical",
+                        size_hint_x=None, width=dp(30))
+            lb = Label(text="", color=(H("#ff6b6b") if red else TEXT),
+                       font_size="17sp", bold=True)
+            cell.add_widget(lb)
+            cells.append(lb)
+            crow.add_widget(cell)
+            if i == w_cnt - 1:
+                crow.add_widget(Label(text=",", color=TEXT, font_size="17sp",
+                                      bold=True, size_hint_x=None,
+                                      width=dp(9)))
+        crow.add_widget(Label(text=meter_unit(self.meter_type), color=MUTED,
+                              font_size="11sp", size_hint_x=None, width=dp(40)))
+        crow.add_widget(Label(size_hint_x=1))
+        content.add_widget(crow)
+
+        def redraw():
+            for i, lb in enumerate(cells):
+                lb.text = st["digits"][i] if i < len(st["digits"]) else ""
+
+        def tap(d):
+            if len(st["digits"]) < total:
+                st["digits"].append(d)
+                redraw()
+
+        def back(*a):
+            if st["digits"]:
+                st["digits"].pop()
+                redraw()
+
+        keys = GridLayout(cols=3, size_hint_y=None, height=dp(190),
+                          spacing=dp(6))
+        for d in ["1", "2", "3", "4", "5", "6", "7", "8", "9"]:
+            k = RoundedButton(text=d, bg=CARD2, fg=TEXT, border=BORDER,
+                              font_size="20sp")
+            k.bind(on_press=lambda *a, dd=d: tap(dd))
+            keys.add_widget(k)
+        kc = RoundedButton(text="СТЕРЕТЬ", bg=BTN2, fg=TEXT, border=BORDER,
+                           font_size="11sp")
+        kc.bind(on_press=back)
+        k0 = RoundedButton(text="0", bg=CARD2, fg=TEXT, border=BORDER,
+                           font_size="20sp")
+        k0.bind(on_press=lambda *a: tap("0"))
+        kd = RoundedButton(text="ОЧИСТИТЬ ВСЁ", bg=BTN2, fg=TEXT,
+                           border=BORDER, font_size="10sp")
+
+        def clear_digits(*a):
+            st["digits"] = []
+            redraw()
+        kd.bind(on_press=clear_digits)
+        keys.add_widget(kc)
+        keys.add_widget(k0)
+        keys.add_widget(kd)
+        content.add_widget(keys)
+
+        pp = Popup(title="Показания счётчика", content=content,
+                   size_hint=(0.96, None), height=dp(370),
+                   title_color=TEXT, separator_color=ACCENT,
+                   background_color=(0.05, 0.05, 0.07, 1))
+
+        def save(*a):
+            ds = st["digits"]
+            whole = "".join(ds[:w_cnt])
+            frac = "".join(ds[w_cnt:])
+            val = ""
+            if whole or frac:
+                val = (whole or "0") + ("," + frac if frac else "")
+            self.meter_data = val
+            self._upd_meter()
+            pp.dismiss()
+
+        def cancel_meter(*a):
+            self.meter_data = ""
+            self._upd_meter()
+            pp.dismiss()
+
+        row = BoxLayout(size_hint_y=None, height=dp(50), spacing=dp(10))
+        cl = RoundedButton(text="УБРАТЬ", bg=BTN2, fg=TEXT, border=BORDER,
+                           font_size="13sp")
+        cl.bind(on_press=cancel_meter)
+        ok = RoundedButton(text="ГОТОВО", bg=ACCENT, fg=DARKTX, font_size="14sp")
+        ok.bind(on_press=save)
+        row.add_widget(cl)
+        row.add_widget(ok)
+        content.add_widget(row)
+
+        redraw()
+        pp.open()
+
+    # ---------- адрес в отдельном окне ----------
+    def edit_address(self):
+        content = BoxLayout(orientation="vertical", spacing=dp(8),
+                            padding=dp(14))
+
+        row = BoxLayout(size_hint_y=None, height=dp(56), spacing=dp(12))
+        cancel = RoundedButton(text="ОТМЕНА", bg=BTN2, fg=TEXT, border=BORDER,
+                               font_size="14sp")
+        ok = RoundedButton(text="СОХРАНИТЬ", bg=ACCENT, fg=DARKTX,
+                           font_size="14sp")
+        row.add_widget(cancel)
+        row.add_widget(ok)
+        content.add_widget(row)
+
+        content.add_widget(body_label("Улица:", color=MUTED, size="13sp",
+                                      h=dp(20)))
+        s_in = make_input("Улица")
+        s_in.text = self.street_val
+        srow = BoxLayout(size_hint_y=None, height=dp(44), spacing=dp(8))
+        srow.add_widget(s_in)
+        s_clr = RoundedButton(text="СТЕР", bg=BTN2, fg=TEXT, border=BORDER,
+                              size_hint_x=None, width=dp(72), font_size="11sp")
+        s_clr.bind(on_release=lambda *a: setattr(s_in, "text", ""))
+        srow.add_widget(s_clr)
+        content.add_widget(srow)
+
+        content.add_widget(body_label("Дом и квартира:", color=MUTED,
+                                      size="13sp", h=dp(20)))
+        hk = BoxLayout(size_hint_y=None, height=dp(48), spacing=dp(8))
+        h_in = make_num_input("Дом")
+        h_in.text = self.house_val
+        h_clr = RoundedButton(text="СТЕР", bg=BTN2, fg=TEXT, border=BORDER,
+                              size_hint_x=None, width=dp(64), font_size="10sp")
+        h_clr.bind(on_release=lambda *a: setattr(h_in, "text", ""))
+        f_in = make_num_input("Кв")
+        f_in.text = self.flat_val
+        f_clr = RoundedButton(text="СТЕР", bg=BTN2, fg=TEXT, border=BORDER,
+                              size_hint_x=None, width=dp(64), font_size="10sp")
+        f_clr.bind(on_release=lambda *a: setattr(f_in, "text", ""))
+        hk.add_widget(h_in)
+        hk.add_widget(h_clr)
+        hk.add_widget(f_in)
+        hk.add_widget(f_clr)
+        content.add_widget(hk)
+        content.add_widget(Label(size_hint_y=1))
+
+        pp = Popup(title="Изменить адрес", content=content,
+                   size_hint=(0.94, None), height=dp(340),
+                   pos_hint={"top": 0.98}, title_color=TEXT,
+                   separator_color=ACCENT,
+                   background_color=(0.05, 0.05, 0.07, 1))
+
+        def save(*a):
+            self.street_val = s_in.text.strip()
+            self.house_val = h_in.text.strip()
+            self.flat_val = f_in.text.strip()
+            self._upd_addr()
+            pp.dismiss()
+
+        cancel.bind(on_release=lambda *a: pp.dismiss())
+        ok.bind(on_release=save)
+        pp.open()
+
+    def edit_comment(self):
+        content = BoxLayout(orientation="vertical", spacing=dp(10),
+                            padding=dp(14))
+
+        row = BoxLayout(size_hint_y=None, height=dp(56), spacing=dp(12))
+        cancel = RoundedButton(text="ОТМЕНА", bg=BTN2, fg=TEXT, border=BORDER,
+                               font_size="14sp")
+        ok = RoundedButton(text="СОХРАНИТЬ", bg=ACCENT, fg=DARKTX,
+                           font_size="14sp")
+        row.add_widget(cancel)
+        row.add_widget(ok)
+        content.add_widget(row)
+
+        ti = make_input("Комментарий")
+        ti.text = self.comment_val
+        content.add_widget(ti)
+        content.add_widget(Label(size_hint_y=1))
+
+        pp = Popup(title="Изменить комментарий", content=content,
+                   size_hint=(0.94, None), height=dp(220),
+                   pos_hint={"top": 0.98}, title_color=TEXT,
+                   separator_color=ACCENT,
+                   background_color=(0.05, 0.05, 0.07, 1))
+
+        _skip7 = [False]
+
+        def _apply7(*a):
+            self.comment_val = ti.text.strip()
+            self._upd_addr()
+
+        def save(*a):
+            _apply7()
+            _skip7[0] = True
+            pp.dismiss()
+
+        def _cancel7(*a):
+            _skip7[0] = True
+            pp.dismiss()
+
+        def _dism7(*a):
+            if not _skip7[0]:
+                _apply7()
+            return False
+
+        pp.bind(on_dismiss=_dism7)
+        ti.bind(on_text_validate=lambda *a: save())
+        cancel.bind(on_release=_cancel7)
+        ok.bind(on_release=save)
+        pp.open()
+
+    def _upd_addr(self):
+        self.addr_lbl.text = build_address(self.street_val, self.house_val,
+                                           self.flat_val) or "Адрес не указан"
+        self.com_lbl.text = self.comment_val or "Комментарий не указан"
+
+    # ---------- вход/выход ----------
+    def on_enter(self, *a):
+        app = App.get_running_app()
+        st, ho, fl = parse_address(app.data.get("default_address", ""))
+        self.street_val = st
+        self.house_val = ho
+        self.flat_val = fl
+        self.comment_val = ""
+        self.meter_type = ""
+        self.meter_data = ""
+        self._upd_addr()
+        self._upd_meter()
+        if app.current_photo:
+            self.img.source = app.current_photo
+            self.img.reload()
+
+    def retake(self):
+        app = App.get_running_app()
+        try:
+            if app.current_photo and os.path.exists(app.current_photo):
+                os.remove(app.current_photo)
+        except Exception as e:
+            print("Не удалось удалить снимок:", e)
+        app.current_photo = None
+        self.manager.transition.direction = "right"
+        self.manager.current = "camera"
+        cam = self.manager.get_screen("camera")
+        Clock.schedule_once(lambda dt: cam.launch(), 0.15)
+
+    def _collect(self):
+        app = App.get_running_app()
+        app.current_caption = build_address(self.street_val, self.house_val,
+                                            self.flat_val)
+        app.current_comment = self.comment_val
+        app.current_meter = self.meter_data
+        app.current_meter_type = self.meter_type
+
+    def go_send(self):
+        self._collect()
+        self.manager.transition.direction = "left"
+        self.manager.current = "method"
+
+    def go_back(self):
+        app = App.get_running_app()
+        try:
+            if app.current_photo and os.path.exists(app.current_photo):
+                os.remove(app.current_photo)
+        except Exception as e:
+            print("Не удалось удалить снимок:", e)
+        app.current_photo = None
+        app.current_caption = ""
+        app.current_comment = ""
+        self.manager.transition.direction = "right"
+        self.manager.current = "camera"
+
+    def save_only(self):
+        self._collect()
+        app = App.get_running_app()
+        app.add_to_archive(method="Сохранено", recipient="")
+        app.current_photo = None
+        self.manager.transition.direction = "left"
+        self.manager.current = "archive"
+
+
+# =====================================================================
+#  ЭКРАН 3: СПОСОБ ОТПРАВКИ (MMS / MAX)
+# =====================================================================
+
+class SendMethodScreen(Screen):
+    def __init__(self, **kw):
+        super().__init__(**kw)
+        root = BoxLayout(orientation="vertical", padding=dp(24), spacing=dp(18))
+        root.add_widget(title_label("КАК ОТПРАВИТЬ?", color=TEXT))
+
+        mms = RoundedButton(text="MMS  (на номер из списка)", bg=ACCENT2, fg=TEXT,
+                            size_hint_y=None, height=dp(96), font_size="17sp")
+        mms.bind(on_release=lambda *a: self.pick_mms())
+        root.add_widget(mms)
+
+        mx = RoundedButton(text="MAX / ПОДЕЛИТЬСЯ\n(адресата выбираете в MAX)",
+                           bg=ACCENT, fg=DARKTX,
+                           size_hint_y=None, height=dp(96), font_size="15sp")
+        mx.bind(on_release=lambda *a: self.pick_max())
+        root.add_widget(mx)
+
+        root.add_widget(Label(size_hint_y=1))  # растяжка
+
+        back = RoundedButton(text="НАЗАД", bg=BACKC, fg=TEXT, border=None,
+                             size_hint_y=None, height=dp(64), font_size="16sp")
+        back.bind(on_release=lambda *a: self.go_back())
+        root.add_widget(back)
+
+        self.add_widget(root)
+
+    def pick_mms(self):
+        self.manager.transition.direction = "left"
+        self.manager.current = "mms"
+
+    def pick_max(self):
+        app = App.get_running_app()
+        _mt = meter_line(app.current_meter_type, app.current_meter)
+        to_send = stamped_image_path(app.current_photo, app.current_caption,
+                                    app.current_comment, _mt)
+        ok = share_photo(to_send)
+        if not ok:
+            toast("Не удалось открыть «Поделиться».\n"
+                  "Проверьте разрешения на фото/хранилище.")
+            return
+        app.add_to_archive(method="MAX", recipient="")
+        app.current_photo = None
+        self.manager.transition.direction = "left"
+        self.manager.current = "archive"
+
+    def go_back(self):
+        self.manager.transition.direction = "right"
+        self.manager.current = "review"
+
+# =====================================================================
+#  ЭКРАН 4: ВЫБОР АДРЕСАТА ДЛЯ MMS
+#  Два режима отображения (переключаются в настройках):
+#    "list" — все имена списком
+#    "last" — последний адресат крупно + плюс для остальных
+# =====================================================================
+
+class MMSScreen(Screen):
+    def __init__(self, **kw):
+        super().__init__(**kw)
+        self._show_all = False  # для режима "last": раскрыт ли полный список
+        self.root = BoxLayout(orientation="vertical", padding=dp(18), spacing=dp(12))
+        self.add_widget(self.root)
+
+    def on_enter(self, *a):
+        self._show_all = False
+        self.rebuild()
+
+    def rebuild(self):
+        app = App.get_running_app()
+        self.root.clear_widgets()
+        self.root.add_widget(title_label("КОМУ ОТПРАВИТЬ (MMS)", color=TEXT))
+
+        recips = app.data.get("recipients", [])
+        mode = app.data.get("settings", {}).get("mms_mode", "list")
+
+        scroll = ScrollView()
+        col = GridLayout(cols=1, spacing=dp(12), size_hint_y=None, padding=[0, dp(4)])
+        col.bind(minimum_height=col.setter("height"))
+
+        if not recips:
+            col.add_widget(body_label("Пока нет ни одного адресата.",
+                                      color=MUTED, size="15sp", h=dp(40),
+                                      halign="center"))
+        elif mode == "last" and not self._show_all:
+            # Показываем только последнего адресата крупно
+            idx = app.data.get("last_recipient", 0)
+            if idx >= len(recips):
+                idx = 0
+            r = recips[idx]
+            big = RoundedButton(text=r["name"], bg=ACCENT, fg=DARKTX,
+                                size_hint_y=None, height=dp(96), font_size="20sp")
+            big.bind(on_release=lambda *a, i=idx: self.do_send(i))
+            col.add_widget(big)
+            if len(recips) > 1:
+                other = RoundedButton(text="ДРУГОЙ  +", bg=BTN2, fg=TEXT, border=BORDER,
+                                      size_hint_y=None, height=dp(72), font_size="16sp")
+                other.bind(on_release=lambda *a: self._expand())
+                col.add_widget(other)
+        else:
+            # Полный список имён
+            for i, r in enumerate(recips):
+                b = RoundedButton(text=r["name"], bg=CARD2, fg=TEXT, border=BORDER,
+                                  size_hint_y=None, height=dp(78), font_size="18sp")
+                b.bind(on_release=lambda *a, idx=i: self.do_send(idx))
+                col.add_widget(b)
+
+        # Кнопка добавить нового адресата
+        add = RoundedButton(text="+  ДОБАВИТЬ НОМЕР", bg=ACCENT2, fg=TEXT,
+                            size_hint_y=None, height=dp(72), font_size="16sp")
+        add.bind(on_release=lambda *a: self.add_popup())
+        col.add_widget(add)
+
+        scroll.add_widget(col)
+        self.root.add_widget(scroll)
+
+        back = RoundedButton(text="НАЗАД", bg=BACKC, fg=TEXT, border=None,
+                             size_hint_y=None, height=dp(64), font_size="16sp")
+        back.bind(on_release=lambda *a: self.go_back())
+        self.root.add_widget(back)
+
+    def _expand(self):
+        self._show_all = True
+        self.rebuild()
+
+    def do_send(self, index):
+        app = App.get_running_app()
+        recips = app.data.get("recipients", [])
+        if index >= len(recips):
+            return
+        r = recips[index]
+        _mt = meter_line(app.current_meter_type, app.current_meter)
+        to_send = stamped_image_path(app.current_photo, app.current_caption,
+                                    app.current_comment, _mt)
+        ok = send_mms(to_send, r["number"])
+        if not ok:
+            toast("Не удалось открыть отправку MMS.\n"
+                  "Проверьте разрешения и приложение сообщений.")
+            return
+        app.data["last_recipient"] = index
+        app.save()
+        app.add_to_archive(method="MMS", recipient=r["name"])
+        app.current_photo = None
+        self.manager.transition.direction = "left"
+        self.manager.current = "archive"
+
+    def add_popup(self, then_send=True):
+        app = App.get_running_app()
+        content = BoxLayout(orientation="vertical", spacing=dp(12), padding=dp(14))
+        name_in = make_input("Имя (например, Олег)")
+        num_in = make_input("Номер (+7...)")
+        content.add_widget(name_in)
+        content.add_widget(num_in)
+
+        row = BoxLayout(size_hint_y=None, height=dp(64), spacing=dp(12))
+        popup = Popup(title="Новый адресат", content=content,
+                      size_hint=(0.9, None), height=dp(300),
+                      pos_hint={"top": 0.98},
+                      title_color=TEXT, separator_color=ACCENT,
+                      background_color=(0.05, 0.05, 0.07, 1))
+
+        def save(*a):
+            name = name_in.text.strip()
+            num = num_in.text.strip()
+            if not name or not num:
+                return
+            app.data["recipients"].append({"name": name, "number": num})
+            app.data["last_recipient"] = len(app.data["recipients"]) - 1
+            app.save()
+            popup.dismiss()
+            if then_send:
+                self.do_send(len(app.data["recipients"]) - 1)
+            else:
+                self.rebuild()
+
+        cancel = RoundedButton(text="ОТМЕНА", bg=BTN2, fg=TEXT, border=BORDER, font_size="15sp")
+        cancel.bind(on_release=lambda *a: popup.dismiss())
+        ok = RoundedButton(text="СОХРАНИТЬ", bg=ACCENT, fg=DARKTX, font_size="15sp")
+        ok.bind(on_release=save)
+        row.add_widget(cancel)
+        row.add_widget(ok)
+        content.add_widget(row, index=len(content.children))  # кнопки над полем: иначе их закроет клавиатура
+        popup.open()
+
+    def go_back(self):
+        self.manager.transition.direction = "right"
+        self.manager.current = "method"
+
+# =====================================================================
+#  ЭКРАН 5: АРХИВ (миниатюры, дата, адресат, способ, адрес, удаление)
+# =====================================================================
+
+class ArchiveScreen(Screen):
+    def __init__(self, **kw):
+        super().__init__(**kw)
+        self.selected = set()
+        self.root = BoxLayout(orientation="vertical", padding=dp(14), spacing=dp(10))
+        self.add_widget(self.root)
+
+    def on_enter(self, *a):
+        self.selected = set()
+        self.rebuild()
+
+    def rebuild(self):
+        app = App.get_running_app()
+        self.root.clear_widgets()
+        self._card_updaters = {}
+        archive = app.data.get("archive", [])
+
+        # Главная кнопка — крупная и отдельно
+        _srow = BoxLayout(size_hint_y=None, height=dp(66), spacing=dp(8))
+        shot = RoundedButton(text="СНЯТЬ ФОТО", bg=ACCENT, fg=DARKTX,
+                             border=H("#bff4dc"), font_size="19sp")
+        shot.bind(on_release=lambda *a: self.go_camera())
+        _srow.add_widget(shot)
+        _srow.add_widget(Label(size_hint_x=None, width=dp(56)))
+        self.root.add_widget(_srow)
+
+        top1 = BoxLayout(size_hint_y=None, height=dp(40), spacing=dp(8))
+        # Слева всегда «уйти отсюда»: без выделения — на главную,
+        # с выделением — назад. Кнопку назад привычнее искать слева.
+        home = RoundedButton(text="ГЛАВНАЯ", bg=ACCENT2, fg=TEXT,
+                             border=H("#cfe4ff"), font_size="12sp")
+
+        def _home_press(*a):
+            if self.selected:
+                self.clear_selection()
+            else:
+                self.go_home()
+        home.bind(on_release=_home_press)
+        self._home_btn = home
+        gal = RoundedButton(text="ГАЛЕРЕЯ", bg=BTN2, fg=TEXT, border=BORDER,
+                            font_size="12sp")
+        gal.bind(on_release=lambda *a: self.go_gallery())
+        sett = RoundedButton(text="      НАСТРОЙКИ", bg=BTN2, fg=H("#ffd166"), border=BORDER,
+                             font_size="10sp")
+        sett.bind(on_release=lambda *a: self.go_settings())
+        import math as _gm
+        def _draw_gear(*_a):
+            from kivy.graphics import Color as _GC, Line as _GL
+            sett.canvas.after.clear()
+            cx = sett.x + dp(10); cy = sett.center_y; r = dp(5)
+            with sett.canvas.after:
+                _GC(1.0, 0.82, 0.40, 1)
+                _GL(circle=(cx, cy, r), width=2.4)
+                _GL(circle=(cx, cy, r * 0.45), width=1.9)
+                for _k in range(8):
+                    _an = _gm.pi * 2 * _k / 8.0
+                    _GL(points=[cx + _gm.cos(_an) * r, cy + _gm.sin(_an) * r, cx + _gm.cos(_an) * (r + dp(3.2)), cy + _gm.sin(_an) * (r + dp(3.2))], width=2.4)
+        sett.bind(pos=_draw_gear, size=_draw_gear)
+        top1.add_widget(home)
+        top1.add_widget(gal)
+        top1.add_widget(sett)
+        self.root.add_widget(top1)
+
+        # Кнопки выделения тут не висят: они появляются сами,
+        # когда тронешь галочку на фото (см. _refresh_actions).
+
+        # Панель действий (обновляется без перестройки списка)
+        self.act_container = BoxLayout(orientation="vertical", size_hint_y=None,
+                                       height=0, spacing=dp(10))
+        self.root.add_widget(self.act_container)
+
+        self.root.add_widget(title_label("АРХИВ — СЕГОДНЯ", color=ACCENT,
+                                         size="18sp"))
+
+        if not archive:
+            self.root.add_widget(body_label("Архив пуст.", color=MUTED,
+                                            size="15sp", h=dp(40), halign="center"))
+            self.root.add_widget(Label(size_hint_y=1))
+            return
+
+        scroll = ScrollView()
+        colw = GridLayout(cols=1, spacing=dp(12), size_hint_y=None, padding=[0, dp(4)])
+        colw.bind(minimum_height=colw.setter("height"))
+
+        # В архиве — только сегодняшние фото. Прошлые дни — в «ГАЛЕРЕЕ».
+        today = datetime.now().strftime("%d.%m.%Y")
+        shown = 0
+        for real_index in range(len(archive) - 1, -1, -1):
+            entry = archive[real_index]
+            if (entry.get("date", "")[:10]) != today:
+                continue
+            colw.add_widget(self._make_card(entry, real_index))
+            shown += 1
+
+        if shown == 0:
+            colw.add_widget(body_label("Сегодня фото ещё нет.\n"
+                                       "Прошлые дни — в «ГАЛЕРЕЕ».",
+                                       color=MUTED, size="15sp", h=dp(70),
+                                       halign="center"))
+        else:
+            colw.add_widget(body_label("Прошлые дни — в «ГАЛЕРЕЕ»",
+                                       color=MUTED, size="13sp", h=dp(40),
+                                       halign="center"))
+
+        scroll.add_widget(colw)
+        self.root.add_widget(scroll)
+        self._refresh_actions()
+
+    def _preheat_today(self):
+        """Заранее готовим сегодняшние фото с плашкой — просмотр без ожидания."""
+        app = App.get_running_app()
+        today = datetime.now().strftime("%d.%m.%Y")
+        items = [e for e in app.data.get("archive", [])
+                 if (e.get("date", "")[:10]) == today]
+
+        def work():
+            for e in items:
+                try:
+                    f = e.get("file", "")
+                    if not f or not os.path.exists(f):
+                        continue
+                    c1, c2 = e.get("caption", ""), e.get("comment", "")
+                    if not c1 and not c2:
+                        continue
+                    if stamped_ready(f, c1, c2):
+                        continue
+                    stamped_image_path(f, c1, c2)
+                except Exception as ex:
+                    print("preheat archive:", ex)
+        threading.Thread(target=work, daemon=True).start()
+
+    def _refresh_actions(self):
+        """Ряд действий виден только когда что-то выбрано.
+        Кнопка выделения одна и меняется по состоянию — так меньше
+        кнопок и не надо искать нужную."""
+        c = getattr(self, "act_container", None)
+        if c is None:
+            return
+        c.clear_widgets()
+        n = len(self.selected)
+
+        # Левая кнопка подрабатывает кнопкой «назад»
+        hb = getattr(self, "_home_btn", None)
+        if hb is not None:
+            hb.text = "НАЗАД" if n else "ГЛАВНАЯ"
+            hb.set_bg(BACKC if n else ACCENT2)
+
+        if not n:
+            c.height = 0
+            return
+
+        shown = set(self._card_updaters.keys())
+        all_on = bool(shown) and shown.issubset(self.selected)
+
+        c.height = dp(94)
+        box = BoxLayout(orientation="vertical", size_hint_y=None,
+                        height=dp(94), spacing=dp(6))
+
+        row1 = BoxLayout(size_hint_y=None, height=dp(44), spacing=dp(8))
+        if all_on:
+            # Выделено всё: теперь осмысленно отправить (зелёная ниже),
+            # поэтому эта кнопка нарочно тусклая.
+            b = RoundedButton(text="СНЯТЬ ВЫДЕЛЕНИЕ", bg=BTN2, fg=TEXT,
+                              border=BORDER, font_size="13sp")
+            b.bind(on_release=lambda *a: self.clear_selection())
+        else:
+            # Жёлтая — единственная такая на экране, находится сразу.
+            b = RoundedButton(text="ВЫДЕЛИТЬ ВСЕ ФОТО", bg=H("#ffd166"),
+                              fg=DARKTX, border=None, font_size="13sp")
+            b.bind(on_release=lambda *a: self.select_all())
+        row1.add_widget(b)
+        box.add_widget(row1)
+
+        row2 = BoxLayout(size_hint_y=None, height=dp(44), spacing=dp(8))
+        send = RoundedButton(text="ОТПРАВИТЬ (%d)" % n, bg=ACCENT, fg=DARKTX,
+                             font_size="14sp")
+        send.bind(on_release=lambda *a: self.send_selected())
+        dely = RoundedButton(text="УДАЛИТЬ (%d)" % n, bg=DANGER, fg=TEXT,
+                             font_size="14sp")
+        dely.bind(on_release=lambda *a: self.delete_selected())
+        row2.add_widget(send)
+        row2.add_widget(dely)
+        box.add_widget(row2)
+
+        c.add_widget(box)
+
+    def _group_header(self, text):
+        lb = Label(text=text, color=H("#8ab4ff"), font_size="15sp", bold=True,
+                   size_hint_y=None, height=dp(40), halign="left", valign="middle")
+        lb.bind(size=lambda w, *a: setattr(w, "text_size", (w.width, None)))
+        return lb
+
+    def _make_card(self, entry, index):
+        selected = index in self.selected
+        bg = CARD2 if selected else CARD
+        top_h = dp(190)          # фото + кнопки ПРОСМОТР/УДАЛИТЬ
+        cap_h = dp(35)
+        com_h = dp(39)
+        card_h = dp(18) + top_h + dp(6) + cap_h + dp(4) + com_h
+        card = Card(bg=bg, orientation="vertical", size_hint_y=None,
+                    height=card_h, padding=dp(10), spacing=dp(8))
+
+        # Рамка выделения (всегда есть, прозрачная когда не выбрано)
+        with card.canvas.after:
+            bcol = Color(*ACCENT)
+            bcol.a = 1 if selected else 0
+            bln = Line(width=2.0)
+
+        def _upd_ln(*a, ln=bln, c=card):
+            ln.rounded_rectangle = (c.x, c.y, c.width, c.height, 18)
+        card.bind(pos=_upd_ln, size=_upd_ln)
+
+        # Верхняя строка: большое фото + информация справа
+        top = BoxLayout(orientation="horizontal", size_hint_y=None,
+                        height=top_h, spacing=dp(12))
+
+        thumb = ImageButton(allow_stretch=True, keep_ratio=True)
+        tp = cached_thumb_path(entry.get("file"))
+        src_exists = bool(entry.get("file") and os.path.exists(entry["file"]))
+        if tp:
+            thumb.source = tp
+        elif src_exists:
+            self._load_thumb_async(entry["file"], thumb)
+        else:
+            # Фото недоступно (например, удалено) — тёмная заглушка вместо белого
+            with thumb.canvas.before:
+                Color(0.16, 0.16, 0.22, 1)
+                _mr = RoundedRectangle(radius=[8])
+
+            def _upd_mr(*a, r=_mr, t=thumb):
+                r.pos = t.pos
+                r.size = t.size
+            thumb.bind(pos=_upd_mr, size=_upd_mr)
+        thumb.bind(on_release=lambda *a, i=index: self.toggle_select(i))
+
+        # Галочка-квадратик в левом верхнем углу фото (обновляемая)
+        chk_state = {"sel": selected}
+        with thumb.canvas.after:
+            sqcol = Color(*(ACCENT if selected else (0, 0, 0, 0.45)))
+            csq = RoundedRectangle(size=(dp(30), dp(30)), pos=(-100, -100),
+                                   radius=[6])
+            chkcol = Color(*(DARKTX if selected else (1, 1, 1, 0.9)))
+            cln = Line(width=2.2 if selected else 1.6)
+
+        def _draw_chk(*a, th=thumb, sq=csq, ln=cln, st=chk_state):
+            s = dp(30)
+            x = th.x + dp(5)
+            y = th.top - s - dp(5)
+            sq.pos = (x, y)
+            sq.size = (s, s)
+            if st["sel"]:
+                ln.width = 2.2
+                ln.points = [x + s * 0.22, y + s * 0.5,
+                             x + s * 0.42, y + s * 0.28,
+                             x + s * 0.78, y + s * 0.74]
+            else:
+                ln.width = 1.6
+                ln.rounded_rectangle = (x, y, s, s, 6)
+        thumb.bind(pos=_draw_chk, size=_draw_chk)
+
+        left = BoxLayout(orientation="vertical", size_hint_x=None,
+                         width=dp(180), spacing=dp(5))
+        left.add_widget(thumb)
+        view = RoundedButton(text="ПРОСМОТР", bg=ACCENT2, fg=TEXT,
+                             border=H("#cfe4ff"),
+                             size_hint_y=None, height=dp(40), font_size="14sp")
+        view.bind(on_release=lambda *a, e=entry: self.open_preview(e))
+        left.add_widget(view)
+        top.add_widget(left)
+
+        # Функция мгновенного обновления вида выбора (без перестройки)
+        def set_sel(sel, cd=card, bc=bcol, sc=sqcol, cc=chkcol,
+                    st=chk_state, draw=_draw_chk):
+            cd._col.rgba = CARD2 if sel else CARD
+            bc.a = 1 if sel else 0
+            sc.rgba = ACCENT if sel else (0, 0, 0, 0.45)
+            cc.rgba = DARKTX if sel else (1, 1, 1, 0.9)
+            st["sel"] = sel
+            draw()
+        self._card_updaters[index] = set_sel
+
+        # Информация справа от фото (нормальной ширины)
+        info = BoxLayout(orientation="vertical", spacing=dp(3))
+        who = entry.get("recipient") or "—"
+        method = entry.get("method", "")
+        _d = entry.get("date", "")
+        _time = _d.split()[-1] if _d else ""
+        info.add_widget(body_label(_time, color=TEXT, size="15sp", h=dp(28)))
+        info.add_widget(body_label("%s  \u2022  %s" % (method, who),
+                                   color=ACCENT, size="14sp", h=dp(26)))
+        geo_lb = body_label(self._geo_text(entry), color=MUTED,
+                            size="13sp", h=dp(26))
+        info.add_widget(geo_lb)
+        info.add_widget(Label(size_hint_y=1))
+        dele = RoundedButton(text="УДАЛИТЬ", bg=DANGER, fg=TEXT,
+                             border=H("#ffd2d2"),
+                             size_hint_y=None, height=dp(40), font_size="13sp")
+        def _confirm_delete(i):
+            from kivy.uix.popup import Popup as _P
+            from kivy.uix.boxlayout import BoxLayout as _B
+            from kivy.uix.label import Label as _L
+            _c = _B(orientation="vertical", spacing=dp(12), padding=dp(16))
+            _c.add_widget(_L(text="Удалить это фото?"))
+            _r = _B(size_hint_y=None, height=dp(48), spacing=dp(12))
+            _no = RoundedButton(text="ОТМЕНА", bg=BTN2, fg=TEXT, border=BORDER, font_size="14sp")
+            _ok = RoundedButton(text="УДАЛИТЬ", bg=DANGER, fg=TEXT, font_size="14sp")
+            _r.add_widget(_no); _r.add_widget(_ok); _c.add_widget(_r)
+            _pp = _P(title="Удаление", content=_c, size_hint=(0.82, None), height=dp(180))
+            _no.bind(on_release=lambda *a: _pp.dismiss())
+            def _go(*a):
+                _pp.dismiss(); self.delete_entry(i)
+            _ok.bind(on_release=_go)
+            _pp.open()
+        dele.bind(on_release=lambda *a, i=index: _confirm_delete(i))
+        info.add_widget(dele)
+        top.add_widget(info)
+        card.add_widget(top)
+
+        if (entry.get("lat") is not None and entry.get("lon") is not None
+                and not entry.get("address") and not entry.get("geo_checked")):
+            self._fetch_address(entry, geo_lb)
+
+        # Строка адреса: жёлтая рамка + кнопка правки справа
+        caprow = BoxLayout(orientation="horizontal", size_hint_y=None,
+                           height=cap_h, spacing=dp(8))
+        capf = Card(bg=CARD2, border=H("#ffd166"), orientation="vertical",
+                    padding=dp(2))
+        capf.add_widget(body_label(split_address(entry.get("caption"))
+                                   or "Адрес не указан",
+                                   color=H("#ffd166"),
+                                   size="12sp", h=dp(31), halign="center"))
+        # Кнопки правки тут нет: адрес правится в ПРОСМОТР ->
+        # РЕДАКТИРОВАТЬ. Строка занимает всю ширину и лучше читается.
+        caprow.add_widget(capf)
+        card.add_widget(caprow)
+
+        # Строка комментария: рамка + кнопка правки справа
+        comrow = BoxLayout(orientation="horizontal", size_hint_y=None,
+                           height=com_h, spacing=dp(8))
+        comf = Card(bg=CARD2, border=BORDER, orientation="vertical", padding=dp(2))
+        _mt = meter_text(entry)
+        _ct = entry.get("comment") or ""
+        _line = (("%s   |   %s" % (_mt, _ct)) if (_mt and _ct)
+                 else (_mt or _ct or "Комментарий не указан"))
+        if _mt:
+            if _mt.startswith("ХОЛОДНАЯ"):
+                _col = H("#4da3ff")
+            elif _mt.startswith("ГОРЯЧАЯ"):
+                _col = H("#ff5c5c")
+            else:
+                _col = H("#ffd166")
+        else:
+            _col = TEXT if _ct else MUTED
+        import re as _re
+        _typ = (_mt.split()[0] if _mt else "")
+        _m = _re.search(r"(\d[\d ]*)\s*,\s*(\d+)", _mt or "")
+        _whole = ""; _frac = ""
+        if _m:
+            _whole = _m.group(1).replace(" ", ""); _frac = _m.group(2)
+        else:
+            _m2 = _re.search(r"(\d+)", _mt or "")
+            if _m2:
+                _whole = _m2.group(1)
+        _unit = "кВт·ч" if ("кВт" in (_mt or "")) else ("м3" if _whole else "")
+        from kivy.graphics import Color as _GC2, Line as _GL2
+        import os as _os4, datetime as _dt4
+        try:
+            _fp4 = entry.get("file", "")
+            if _fp4 and _os4.path.exists(_fp4):
+                _dm4 = _dt4.datetime.fromtimestamp(_os4.path.getmtime(_fp4))
+            else:
+                _dm4 = _dt4.datetime.now()
+            _mon_c = ["", "ЯНВАРЬ", "ФЕВРАЛЬ", "МАРТ", "АПРЕЛЬ", "МАЙ", "ИЮНЬ", "ИЮЛЬ", "АВГУСТ", "СЕНТЯБРЬ", "ОКТЯБРЬ", "НОЯБРЬ", "ДЕКАБРЬ"][_dm4.month]
+        except Exception:
+            _mon_c = ""
+        def _mkcell(_dch, _fg):
+            _lb = Label(text=_dch, color=_fg, font_size="11sp", bold=True, size_hint=(None, None), size=(dp(17), dp(16)), pos_hint={"center_y": 0.5})
+            with _lb.canvas.before:
+                _GC2(0.45, 0.45, 0.52, 1)
+                _ln2 = _GL2(width=1.2)
+            def _upd(_w, *_a):
+                _ln2.rounded_rectangle = (_w.x + dp(1), _w.y + dp(1), _w.width - dp(2), _w.height - dp(2), dp(3))
+            _lb.bind(pos=_upd, size=_upd)
+            return _lb
+        if _whole:
+            _bar = BoxLayout(orientation="horizontal", size_hint_y=None, height=dp(17), spacing=dp(3))
+            if _typ:
+                _tl = Label(text=_typ, color=_col, font_size="12sp", bold=True, size_hint_x=None, width=dp(2))
+                _tl.bind(texture_size=lambda w, s: setattr(w, "width", s[0] + dp(4)))
+                _bar.add_widget(_tl)
+            _bar.add_widget(Label(size_hint_x=1))
+            for _d in _whole:
+                _bar.add_widget(_mkcell(_d, (0.95, 0.95, 0.98, 1)))
+            if _frac:
+                _bar.add_widget(Label(text=",", color=(0.95, 0.95, 0.98, 1), font_size="14sp", bold=True, size_hint_x=None, width=dp(6)))
+                for _d in _frac:
+                    _bar.add_widget(_mkcell(_d, (1.0, 0.36, 0.36, 1)))
+            if _unit:
+                _ul = Label(text=_unit, color=MUTED, font_size="9sp", size_hint_x=None, width=dp(2))
+                _ul.bind(texture_size=lambda w, s: setattr(w, "width", s[0] + dp(6)))
+                _bar.add_widget(_ul)
+            _bar.add_widget(Label(size_hint_x=1))
+            comf.add_widget(_bar)
+            _bar2 = BoxLayout(orientation="horizontal", size_hint_y=None, height=dp(14), spacing=dp(3))
+            if _mon_c:
+                _ml = Label(text=_mon_c, color=(1.0, 0.82, 0.4, 1), font_size="11sp", bold=True, size_hint=(None, None), height=dp(14), pos_hint={"center_y": 0.5}, width=dp(2))
+                _ml.bind(texture_size=lambda w, s: setattr(w, "width", s[0] + dp(4)))
+                _bar2.add_widget(_ml)
+            else:
+                _bar2.add_widget(Label(size_hint_x=None, width=dp(1)))
+            _bar2.add_widget(Label(size_hint_x=1))
+            if _ct:
+                _bar2.add_widget(Label(text=_ct, color=MUTED, font_size="12sp", size_hint=(None, None), height=dp(14), pos_hint={"center_y": 0.5}, width=dp(2)))
+                _bar2.children[0].bind(texture_size=lambda w, s: setattr(w, "width", s[0] + dp(4)))
+            _bar2.add_widget(Label(size_hint_x=1))
+            comf.add_widget(_bar2)
+        else:
+            _bar3 = BoxLayout(orientation="horizontal", size_hint_y=None,
+                              height=dp(15), spacing=dp(3))
+            _bar3.add_widget(Label(size_hint_x=1))
+            if _mon_c:
+                _ml3 = Label(text=_mon_c, color=(1.0, 0.82, 0.4, 1),
+                             font_size="11sp", bold=True,
+                             size_hint=(None, None), height=dp(15),
+                             pos_hint={"center_y": 0.5}, width=dp(2))
+                _ml3.bind(texture_size=lambda w, s: setattr(w, "width", s[0] + dp(10)))
+                _bar3.add_widget(_ml3)
+            _cl3 = Label(text=(_ct or "Комментарий не указан"),
+                         color=MUTED, font_size="11sp",
+                         size_hint=(None, None), height=dp(15),
+                         pos_hint={"center_y": 0.5}, width=dp(2))
+            _cl3.bind(texture_size=lambda w, s: setattr(w, "width", s[0] + dp(4)))
+            _bar3.add_widget(_cl3)
+            _bar3.add_widget(Label(size_hint_x=1))
+            comf.add_widget(_bar3)
+        # Комментарий и показания правятся там же — в просмотре.
+        comrow.add_widget(comf)
+        card.add_widget(comrow)
+
+        return card
+
+    def _load_thumb_async(self, src, thumb):
+        def work():
+            tp = make_thumb(src)
+            if tp:
+                self._set_thumb(thumb, tp)
+        threading.Thread(target=work, daemon=True).start()
+
+    @mainthread
+    def _set_thumb(self, thumb, tp):
+        try:
+            thumb.source = tp
+            thumb.reload()
+        except Exception:
+            pass
+
+    def _caption_text(self, entry):
+        c = entry.get("caption")
+        return ("Подпись: %s" % c) if c else "Без подписи"
+
+    def open_preview(self, entry):
+        """Просмотр фото: увеличивается двумя пальцами.
+        Правка спрятана под кнопкой РЕДАКТИРОВАТЬ — обычно она не нужна."""
+        box = BoxLayout(orientation="vertical", spacing=dp(8), padding=dp(6))
+        wait = body_label("", color=MUTED, size="14sp", h=0, halign="center")
+        box.add_widget(wait)
+
+        frame = ZoomFrame()
+        img = frame.img
+        box.add_widget(frame)
+
+        def refresh():
+            cap = entry.get("caption", "")
+            com = entry.get("comment", "")
+            mtx = meter_text(entry)
+            src = entry.get("file", "")
+            ready = stamped_ready(src, cap, com, mtx)
+            if ready:
+                wait.text = ""
+                wait.height = 0
+                img.source = ready
+                img.reload()
+            else:
+                quick = cached_thumb_path(src) or (src if os.path.exists(src)
+                                                   else "")
+                if quick:
+                    img.source = quick
+                wait.text = "Готовлю фото..."
+                wait.height = dp(30)
+                self._prepare_stamped(src, cap, com, img, mtx)
+
+        refresh()
+
+        hint = body_label("Фото увеличивается двумя пальцами",
+                          color=MUTED, size="11sp", h=dp(18), halign="center")
+        box.add_widget(hint)
+
+        erow = BoxLayout(size_hint_y=None, height=dp(44), spacing=dp(6))
+
+        def show_edit(on):
+            erow.clear_widgets()
+            if not on:
+                eb = RoundedButton(text="РЕДАКТИРОВАТЬ", bg=BTN2, fg=TEXT,
+                                   border=BORDER, font_size="13sp")
+                eb.bind(on_release=lambda *a: show_edit(True))
+                erow.add_widget(eb)
+                return
+            ea = RoundedButton(text="АДРЕС", bg=H("#ffd166"), fg=DARKTX,
+                               font_size="12sp")
+            ea.bind(on_release=lambda *a: self.edit_address_dialog(entry,
+                                                                   refresh))
+            ec = RoundedButton(text="КОММЕНТ.", bg=BTN2, fg=TEXT,
+                               border=BORDER, font_size="12sp")
+            ec.bind(on_release=lambda *a: self._edit_field(
+                entry, "comment", "Изменить комментарий", "Комментарий",
+                refresh))
+            em = RoundedButton(text="ПОКАЗАНИЯ СЧЁТЧИКА", bg=BTN2,
+                               fg=TEXT, border=BORDER,
+                               font_size="10sp")
+            em.bind(on_release=lambda *a: edit_meter_dialog(entry, refresh))
+            erow.add_widget(ea)
+            erow.add_widget(ec)
+            erow.add_widget(em)
+
+        show_edit(False)
+        box.add_widget(erow)
+
+        back = RoundedButton(text="НАЗАД", bg=BACKC, fg=TEXT, border=None,
+                             size_hint_y=None, height=dp(46), font_size="15sp")
+        box.add_widget(back)
+
+        p = Popup(title="", content=box, size_hint=(0.98, 0.94),
+                  separator_height=0, background_color=(0.0, 0.0, 0.0, 1))
+        back.bind(on_release=lambda *a: p.dismiss())
+        p.open()
+
+    def _prepare_stamped(self, src, cap, com, img, mtx=""):
+        def work():
+            path = stamped_image_path(src, cap, com, mtx)
+            if path:
+                self._set_thumb(img, path)
+        threading.Thread(target=work, daemon=True).start()
+
+    def edit_caption(self, entry):
+        self._edit_field(entry, "caption", "Изменить адрес", "Адрес")
+
+    def edit_comment(self, entry):
+        self._edit_field(entry, "comment", "Изменить комментарий", "Комментарий")
+
+    def edit_address_dialog(self, entry, on_done=None):
+        st, ho, fl = parse_address(entry.get("caption", ""))
+        content = BoxLayout(orientation="vertical", spacing=dp(10), padding=dp(14))
+        s_in = make_input("Улица"); s_in.text = st
+        srow = BoxLayout(size_hint_y=None, height=dp(44), spacing=dp(8))
+        srow.add_widget(s_in)
+        s_clr = RoundedButton(text="СТЕР", bg=BTN2, fg=TEXT, border=BORDER, size_hint_x=None, width=dp(72), font_size="11sp")
+        s_clr.bind(on_release=lambda *a: setattr(s_in, "text", ""))
+        srow.add_widget(s_clr)
+        content.add_widget(srow)
+        hk = BoxLayout(size_hint_y=None, height=dp(48), spacing=dp(8))
+        h_in = make_num_input("Дом"); h_in.text = ho
+        h_clr = RoundedButton(text="СТЕР", bg=BTN2, fg=TEXT, border=BORDER, size_hint_x=None, width=dp(64), font_size="10sp")
+        h_clr.bind(on_release=lambda *a: setattr(h_in, "text", ""))
+        f_in = make_num_input("Кв"); f_in.text = fl
+        f_clr = RoundedButton(text="СТЕР", bg=BTN2, fg=TEXT, border=BORDER, size_hint_x=None, width=dp(64), font_size="10sp")
+        f_clr.bind(on_release=lambda *a: setattr(f_in, "text", ""))
+        hk.add_widget(h_in)
+        hk.add_widget(h_clr)
+        hk.add_widget(f_in)
+        hk.add_widget(f_clr)
+        content.add_widget(hk)
+
+        pp = Popup(title="Изменить адрес", content=content,
+                   size_hint=(0.94, None), height=dp(340),
+                   pos_hint={"top": 0.98},
+                   title_color=TEXT, separator_color=ACCENT,
+                   background_color=(0.05, 0.05, 0.07, 1))
+
+        def save(*a):
+            val = build_address(s_in.text, h_in.text, f_in.text)
+            if val:
+                entry["caption"] = val
+            else:
+                entry.pop("caption", None)
+            app = App.get_running_app()
+            app.remember_address(val)
+            app.save()
+            warm_entry(entry)
+            pp.dismiss()
+            if on_done:
+                on_done()
+            self.rebuild()
+
+        row = BoxLayout(size_hint_y=None, height=dp(60), spacing=dp(12))
+        cancel = RoundedButton(text="ОТМЕНА", bg=BTN2, fg=TEXT, border=BORDER,
+                               font_size="15sp")
+        cancel.bind(on_release=lambda *a: pp.dismiss())
+        ok = RoundedButton(text="СОХРАНИТЬ", bg=ACCENT, fg=DARKTX, font_size="15sp")
+        ok.bind(on_release=save)
+        row.add_widget(cancel); row.add_widget(ok)
+        content.add_widget(row, index=len(content.children))  # кнопки над полем: иначе их закроет клавиатура
+        pp.open()
+
+    def _edit_field(self, entry, key, title, hint, on_done=None):
+        content = BoxLayout(orientation="vertical", spacing=dp(12), padding=dp(14))
+        ti = make_input(hint)
+        ti.text = entry.get(key, "")
+        content.add_widget(ti)
+
+        pp = Popup(title=title, content=content,
+                   size_hint=(0.92, None), height=dp(220),
+                   pos_hint={"top": 0.98},
+                   title_color=TEXT, separator_color=ACCENT,
+                   background_color=(0.05, 0.05, 0.07, 1))
+
+        _skip7 = [False]
+
+        def _apply7(*a):
+            val = ti.text.strip()
+            if val:
+                entry[key] = val
+            else:
+                entry.pop(key, None)
+            App.get_running_app().save()
+
+        def save(*a):
+            _apply7()
+            _skip7[0] = True
+            pp.dismiss()
+            self.rebuild()
+
+        def _cancel7(*a):
+            _skip7[0] = True
+            pp.dismiss()
+
+        def _dism7(*a):
+            if not _skip7[0]:
+                _apply7()
+                self.rebuild()
+            return False
+
+        pp.bind(on_dismiss=_dism7)
+        ti.bind(on_text_validate=lambda *a: save())
+
+        row = BoxLayout(size_hint_y=None, height=dp(64), spacing=dp(12))
+        cancel = RoundedButton(text="ОТМЕНА", bg=BTN2, fg=TEXT, border=BORDER,
+                               font_size="15sp")
+        cancel.bind(on_release=_cancel7)
+        ok = RoundedButton(text="СОХРАНИТЬ", bg=ACCENT, fg=DARKTX, font_size="15sp")
+        ok.bind(on_release=save)
+        row.add_widget(cancel)
+        row.add_widget(ok)
+        content.add_widget(row, index=len(content.children))  # кнопки над полем: иначе их закроет клавиатура
+        pp.open()
+
+    def toggle_select(self, index):
+        if index in self.selected:
+            self.selected.discard(index)
+        else:
+            self.selected.add(index)
+        f = self._card_updaters.get(index)
+        if f:
+            f(index in self.selected)
+        self._refresh_actions()
+
+    def select_all(self):
+        """Выделить только то, что показано на экране — то есть
+        сегодняшние фото. Прошлые дни не трогаем: их тут не видно,
+        а выделять вслепую опасно."""
+        self.selected = set(self._card_updaters.keys())
+        for f in self._card_updaters.values():
+            f(True)
+        self._refresh_actions()
+
+    def clear_selection(self):
+        self.selected = set()
+        for f in self._card_updaters.values():
+            f(False)
+        self._refresh_actions()
+
+    def send_selected(self):
+        app = App.get_running_app()
+        archive = app.data.get("archive", [])
+        entries = []
+        for i in sorted(self.selected):
+            if 0 <= i < len(archive):
+                e = archive[i]
+                if e.get("file") and os.path.exists(e["file"]):
+                    entries.append(e)
+        if not entries:
+            toast("Не выбрано ни одного фото.")
+            return
+
+        content = BoxLayout(orientation="vertical", spacing=dp(12), padding=dp(16))
+        content.add_widget(body_label("Как отправить выбранные (%d)?" % len(entries),
+                                      color=TEXT, size="16sp", h=dp(44),
+                                      halign="center"))
+        pp = Popup(title="", content=content, size_hint=(0.9, None), height=dp(330),
+                   separator_height=0, background_color=(0.05, 0.05, 0.07, 1))
+
+        mms = RoundedButton(text="MMS  (на номер из списка)", bg=ACCENT2, fg=TEXT,
+                            size_hint_y=None, height=dp(74), font_size="15sp")
+        mms.bind(on_release=lambda *a: (pp.dismiss(), self._send_multi_mms(entries)))
+        mx = RoundedButton(text="MAX / ПОДЕЛИТЬСЯ\n(адресата выбираете в MAX)",
+                           bg=ACCENT, fg=DARKTX,
+                           size_hint_y=None, height=dp(74), font_size="13sp")
+        mx.bind(on_release=lambda *a: (pp.dismiss(), self._send_multi_max(entries)))
+        cancel = RoundedButton(text="ОТМЕНА", bg=BTN2, fg=TEXT, border=BORDER,
+                               size_hint_y=None, height=dp(58), font_size="14sp")
+        cancel.bind(on_release=lambda *a: pp.dismiss())
+        content.add_widget(mms)
+        content.add_widget(mx)
+        content.add_widget(cancel)
+        pp.open()
+
+    def _send_multi_max(self, entries):
+        toast("Готовлю отправку...")
+        self.clear_selection()
+
+        def work():
+            paths = [stamped_image_path(e["file"], e.get("caption", ""),
+                                        e.get("comment", ""), meter_text(e))
+                     for e in entries]
+            share_photos_multiple(paths)
+        threading.Thread(target=work, daemon=True).start()
+
+    def _send_multi_mms(self, entries):
+        app = App.get_running_app()
+        recips = app.data.get("recipients", [])
+        if not recips:
+            toast("Сначала добавьте адресата в Настройках.")
+            return
+
+        content = BoxLayout(orientation="vertical", spacing=dp(10), padding=dp(14))
+        content.add_widget(body_label("Кому отправить (MMS)?", color=TEXT,
+                                      size="16sp", h=dp(36), halign="center"))
+        pp = Popup(title="", content=content, size_hint=(0.88, 0.8),
+                   separator_height=0, background_color=(0.05, 0.05, 0.07, 1))
+
+        scroll = ScrollView()
+        col = GridLayout(cols=1, spacing=dp(10), size_hint_y=None)
+        col.bind(minimum_height=col.setter("height"))
+        for r in recips:
+            b = RoundedButton(text=r["name"], bg=CARD2, fg=TEXT, border=BORDER,
+                              size_hint_y=None, height=dp(66), font_size="17sp")
+            b.bind(on_release=lambda *a, num=r["number"]:
+                   self._do_multi_mms(pp, entries, num))
+            col.add_widget(b)
+        scroll.add_widget(col)
+        content.add_widget(scroll)
+
+        cancel = RoundedButton(text="ОТМЕНА", bg=BTN2, fg=TEXT, border=BORDER,
+                               size_hint_y=None, height=dp(58), font_size="14sp")
+        cancel.bind(on_release=lambda *a: pp.dismiss())
+        content.add_widget(cancel)
+        pp.open()
+
+    def _do_multi_mms(self, pp, entries, number):
+        pp.dismiss()
+        toast("Готовлю отправку...")
+        self.clear_selection()
+
+        def work():
+            paths = [stamped_image_path(e["file"], e.get("caption", ""),
+                                        e.get("comment", ""), meter_text(e))
+                     for e in entries]
+            send_mms_multiple(paths, number)
+        threading.Thread(target=work, daemon=True).start()
+
+    def delete_selected(self):
+        n = len(self.selected)
+        if n == 0:
+            toast("Ничего не выбрано.")
+            return
+        confirm_delete("Удалить выбранные (%d)?" % n,
+                       self._do_delete_selected)
+
+    def _do_delete_selected(self):
+        app = App.get_running_app()
+        archive = app.data.get("archive", [])
+        for i in sorted(self.selected, reverse=True):
+            if 0 <= i < len(archive):
+                entry = archive[i]
+                try:
+                    if entry.get("file") and os.path.exists(entry["file"]):
+                        os.remove(entry["file"])
+                except Exception as e:
+                    print("Не удалось удалить файл:", e)
+                del archive[i]
+        app.save()
+        self.selected = set()
+        self.rebuild()
+
+    def _geo_text(self, entry):
+        if entry.get("address"):
+            return entry["address"]
+        if entry.get("lat") is not None and entry.get("lon") is not None:
+            if entry.get("geo_checked"):
+                return "%.5f, %.5f" % (entry["lat"], entry["lon"])
+            return "Определяю адрес..."
+        return "Без геометки"
+
+    def _fetch_address(self, entry, label):
+        lat = entry["lat"]; lon = entry["lon"]
+
+        def worker():
+            addr = reverse_geocode(lat, lon)
+            self._apply_address(entry, label, addr)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    @mainthread
+    def _apply_address(self, entry, label, addr):
+        app = App.get_running_app()
+        entry["geo_checked"] = True
+        if addr:
+            entry["address"] = addr
+        app.save()
+        try:
+            label.text = self._geo_text(entry)
+        except Exception:
+            pass
+
+    def delete_entry(self, index):
+        confirm_delete("Удалить это фото?",
+                       lambda: self._do_delete_entry(index))
+
+    def _do_delete_entry(self, index):
+        app = App.get_running_app()
+        archive = app.data.get("archive", [])
+        if index < 0 or index >= len(archive):
+            return
+        entry = archive[index]
+        try:
+            if entry.get("file") and os.path.exists(entry["file"]):
+                os.remove(entry["file"])
+        except Exception as e:
+            print("Не удалось удалить файл:", e)
+        del archive[index]
+        app.save()
+        self.selected = set()
+        self.rebuild()
+
+    def go_camera(self):
+        self.manager.transition.direction = "right"
+        self.manager.current = "camera"
+        cam = self.manager.get_screen("camera")
+        Clock.schedule_once(lambda dt: cam.launch(), 0.15)
+
+    def go_home(self):
+        self.manager.transition.direction = "right"
+        self.manager.current = "camera"
+
+    def go_gallery(self):
+        self.manager.transition.direction = "left"
+        self.manager.current = "gallery"
+
+    def go_settings(self):
+        self.manager.transition.direction = "left"
+        self.manager.current = "settings"
+
+# =====================================================================
+# =====================================================================
+#  ЭКРАН: ГАЛЕРЕЯ (даты -> сетка фото за день, как в галерее телефона)
+# =====================================================================
+
+class GalleryScreen(Screen):
+    def __init__(self, **kw):
+        super().__init__(**kw)
+        self.day = None  # None = список дат, иначе выбранная дата
+        self.selected = []   # выбранные записи для отправки
+        self.root = BoxLayout(orientation="vertical", padding=dp(12), spacing=dp(8))
+        self.add_widget(self.root)
+
+    def on_enter(self, *a):
+        self.day = None
+        self.selected = []
+        self.rebuild()
+
+    def rebuild(self):
+        app = App.get_running_app()
+        self.root.clear_widgets()
+        archive = app.data.get("archive", [])
+
+        if not archive:
+            self.root.add_widget(self._head("ГАЛЕРЕЯ"))
+            self.root.add_widget(body_label("Архив пуст.", color=MUTED,
+                                            size="15sp", h=dp(40),
+                                            halign="center"))
+            self.root.add_widget(Label(size_hint_y=1))
+            return
+
+        if self.day is None:
+            self._build_days(archive)
+        else:
+            self._build_photos(archive)
+
+    def _head(self, title):
+        """Одна ровная шапка: НАЗАД — заголовок — АРХИВ.
+        НАЗАД сам понимает, куда идти: из дня — к датам, с дат — в архив."""
+        head = BoxLayout(orientation="vertical", size_hint_y=None,
+                         height=dp(46) * 2 + dp(6), spacing=dp(6))
+
+        _r1 = BoxLayout(size_hint_y=None, height=dp(46), spacing=dp(8))
+        arch = RoundedButton(text="АРХИВ", bg=ACCENT2, fg=TEXT,
+                             border=H("#ffd166"), font_size="14sp")
+        arch.bind(on_release=lambda *a: self.go_archive())
+        _r1.add_widget(arch)
+        _r1.add_widget(Label(size_hint_x=None, width=dp(56)))
+        head.add_widget(_r1)
+
+        _r2 = BoxLayout(size_hint_y=None, height=dp(46), spacing=dp(8))
+        back = RoundedButton(text="НАЗАД", bg=BACKC, fg=TEXT,
+                             border=H("#e6e0ff"), font_size="13sp")
+        back.bind(on_release=lambda *a: self.go_back())
+        _tbox = Card(bg=CARD2, border=ACCENT, orientation="vertical",
+                     padding=dp(2))
+        _tbox.add_widget(title_label(title, color=ACCENT, size="16sp"))
+        _r2.add_widget(back)
+        _r2.add_widget(_tbox)
+        _r2.add_widget(Label(size_hint_x=None, width=dp(56)))
+        head.add_widget(_r2)
+        return head
+
+    def _build_days(self, archive):
+        self.root.add_widget(self._head("ГАЛЕРЕЯ"))
+
+        # Собираем даты (новые сверху) и считаем фото
+        days = []
+        counts = {}
+        for e in archive:
+            d = (e.get("date", "")[:10]) or "—"
+            if d not in counts:
+                counts[d] = 0
+                days.append(d)
+            counts[d] += 1
+        days.sort(reverse=True)
+
+        today = datetime.now().strftime("%d.%m.%Y")
+        scroll = ScrollView()
+        col = GridLayout(cols=1, spacing=dp(10), size_hint_y=None,
+                         padding=[0, dp(4)])
+        col.bind(minimum_height=col.setter("height"))
+        for d in days:
+            label = ("СЕГОДНЯ  (%d)" % counts[d]) if d == today \
+                else ("%s  (%d)" % (d, counts[d]))
+            b = RoundedButton(text=label, bg=CARD2, fg=TEXT, border=BORDER,
+                              size_hint_y=None, height=dp(58), font_size="16sp")
+            b.bind(on_release=lambda *a, dd=d: self.open_day(dd))
+            col.add_widget(b)
+        scroll.add_widget(col)
+        self.root.add_widget(scroll)
+
+    def _build_photos(self, archive):
+        today = datetime.now().strftime("%d.%m.%Y")
+        title = "СЕГОДНЯ" if self.day == today else self.day
+        self.root.add_widget(self._head(title))
+
+        items = [e for e in archive if (e.get("date", "")[:10]) == self.day]
+        items.reverse()
+
+        # Один ряд действий вместо трёх рядов кнопок.
+        # Ничего не выбрано -> одна кнопка «ВЫБРАТЬ ВСЁ».
+        # Что-то выбрано -> СНЯТЬ / ОТПРАВИТЬ / УДАЛИТЬ.
+        act = BoxLayout(size_hint_y=None, height=dp(46), spacing=dp(8))
+        if self.selected:
+            n = len(self.selected)
+            clr = RoundedButton(text="СНЯТЬ (%d)" % n, bg=BTN2, fg=TEXT,
+                                border=BORDER, font_size="12sp")
+            clr.bind(on_release=lambda *a: self.clear_sel_gal())
+            snd = RoundedButton(text="ОТПРАВИТЬ (%d)" % n, bg=ACCENT, fg=DARKTX,
+                                font_size="13sp")
+            snd.bind(on_release=lambda *a: self.send_sel_gal())
+            dl = RoundedButton(text="УДАЛИТЬ (%d)" % n, bg=DANGER, fg=TEXT,
+                               font_size="13sp")
+            dl.bind(on_release=lambda *a: self.delete_sel_gal())
+            act.add_widget(clr)
+            act.add_widget(snd)
+            act.add_widget(dl)
+        else:
+            sa = RoundedButton(text="ВЫБРАТЬ ВСЁ", bg=BTN2, fg=TEXT,
+                               border=BORDER, font_size="14sp")
+            sa.bind(on_release=lambda *a, it=items: self.select_all_gal(it))
+            act.add_widget(sa)
+        self.root.add_widget(act)
+
+        scroll = ScrollView()
+        grid = GridLayout(cols=3, spacing=dp(6), size_hint_y=None,
+                          padding=[0, dp(4)])
+        grid.bind(minimum_height=grid.setter("height"))
+        for e in items:
+            cell = BoxLayout(orientation="vertical", size_hint_y=None,
+                             height=dp(180), spacing=dp(2))
+            cell.add_widget(body_label(e.get("caption") or "",
+                                       color=H("#ffd166"),
+                                       size="10sp", h=dp(24), halign="center"))
+
+            wrap = FloatLayout()
+            im = ImageButton(allow_stretch=True, keep_ratio=True,
+                             size_hint=(1, 1), pos_hint={"x": 0, "y": 0})
+            tp = cached_thumb_path(e.get("file"))
+            if tp:
+                im.source = tp
+            elif e.get("file") and os.path.exists(e["file"]):
+                self._load_thumb_async(e["file"], im)
+            im.bind(on_release=lambda *a, ee=e: self.open_photo(ee))
+            wrap.add_widget(im)
+
+            sel = e in self.selected
+            chk = RoundedButton(
+                text=("\u2713" if sel else ""),
+                bg=(ACCENT if sel else (0, 0, 0, 0.55)),
+                fg=DARKTX,
+                border=(None if sel else (1, 1, 1, 0.9)),
+                radius=6, size_hint=(None, None), size=(dp(30), dp(30)),
+                pos_hint={"x": 0.03, "top": 0.97}, font_size="16sp")
+            chk.bind(on_release=lambda *a, ee=e: self.toggle_sel_gal(ee))
+            wrap.add_widget(chk)
+            cell.add_widget(wrap)
+
+            cell.add_widget(body_label(e.get("comment") or "", color=TEXT,
+                                       size="10sp", h=dp(22), halign="center"))
+            grid.add_widget(cell)
+        scroll.add_widget(grid)
+        self.root.add_widget(scroll)
+        if not getattr(self, "_warmed", None) == self.day:
+            self._warmed = self.day
+            self._preheat(items)
+
+    def _preheat(self, items):
+        """Заранее готовим фото с плашкой — просмотр открывается сразу."""
+        def work():
+            n = 0
+            for e in items:
+                try:
+                    src = e.get("file", "")
+                    if not src or not os.path.exists(src):
+                        continue
+                    cap = e.get("caption", "")
+                    com = e.get("comment", "")
+                    if not cap and not com:
+                        continue
+                    mtx = meter_text(e)
+                    if stamped_ready(src, cap, com, mtx):
+                        continue
+                    stamped_image_path(src, cap, com, mtx)
+                    n += 1
+                    # Готовим понемногу и с паузой, иначе телефон
+                    # не успевает и Android ругается «не отвечает».
+                    time.sleep(0.4)
+                    if n >= 4:
+                        break
+                except Exception as ex:
+                    print("preheat:", ex)
+        threading.Thread(target=work, daemon=True).start()
+
+    # --- выделение и отправка из галереи ---
+    def toggle_sel_gal(self, entry):
+        if entry in self.selected:
+            self.selected.remove(entry)
+        else:
+            self.selected.append(entry)
+        self.rebuild()
+
+    def select_all_gal(self, items):
+        self.selected = list(items)
+        self.rebuild()
+
+    def clear_sel_gal(self):
+        self.selected = []
+        self.rebuild()
+
+    def send_sel_gal(self):
+        if not self.selected:
+            toast("Ничего не выбрано.")
+            return
+        entries = list(self.selected)
+        content = BoxLayout(orientation="vertical", spacing=dp(10), padding=dp(14))
+        content.add_widget(body_label("Как отправить (%d)?" % len(entries),
+                                      color=TEXT, size="16sp", h=dp(40),
+                                      halign="center"))
+        pp = Popup(title="", content=content, size_hint=(0.9, None), height=dp(330),
+                   separator_height=0, background_color=(0.05, 0.05, 0.07, 1))
+        mms = RoundedButton(text="MMS  (на номер из списка)", bg=ACCENT2, fg=TEXT,
+                            size_hint_y=None, height=dp(70), font_size="14sp")
+        mms.bind(on_release=lambda *a: (pp.dismiss(), self._gal_mms(entries)))
+        mx = RoundedButton(text="MAX / ПОДЕЛИТЬСЯ", bg=ACCENT, fg=DARKTX,
+                           size_hint_y=None, height=dp(70), font_size="14sp")
+        mx.bind(on_release=lambda *a: (pp.dismiss(), self._gal_max(entries)))
+        cancel = RoundedButton(text="ОТМЕНА", bg=BTN2, fg=TEXT, border=BORDER,
+                               size_hint_y=None, height=dp(52), font_size="13sp")
+        cancel.bind(on_release=lambda *a: pp.dismiss())
+        content.add_widget(mms)
+        content.add_widget(mx)
+        content.add_widget(cancel)
+        pp.open()
+
+    def delete_sel_gal(self):
+        n = len(self.selected)
+        if not n:
+            toast("Ничего не выбрано.")
+            return
+        confirm_delete("Удалить выбранные (%d)?" % n, self._do_delete_sel_gal)
+
+    def _do_delete_sel_gal(self):
+        app = App.get_running_app()
+        archive = app.data.get("archive", [])
+        for e in list(self.selected):
+            try:
+                f = e.get("file")
+                if f and os.path.exists(f):
+                    os.remove(f)
+            except Exception as ex:
+                print("del:", ex)
+            if e in archive:
+                archive.remove(e)
+        app.save()
+        self.selected = []
+        self.rebuild()
+
+    def _gal_max(self, entries):
+        toast("Готовлю отправку...")
+        self.clear_sel_gal()
+
+        def work():
+            paths = [stamped_image_path(e.get("file", ""), e.get("caption", ""),
+                                        e.get("comment", ""), meter_text(e))
+                     for e in entries]
+            share_photos_multiple(paths)
+        threading.Thread(target=work, daemon=True).start()
+
+    def _gal_mms(self, entries):
+        app = App.get_running_app()
+        recips = app.data.get("recipients", [])
+        if not recips:
+            toast("Сначала добавьте адресата в Настройках.")
+            return
+        content = BoxLayout(orientation="vertical", spacing=dp(10), padding=dp(14))
+        content.add_widget(body_label("Кому отправить (MMS)?", color=TEXT,
+                                      size="16sp", h=dp(36), halign="center"))
+        pp = Popup(title="", content=content, size_hint=(0.88, 0.8),
+                   separator_height=0, background_color=(0.05, 0.05, 0.07, 1))
+        scroll = ScrollView()
+        col = GridLayout(cols=1, spacing=dp(10), size_hint_y=None)
+        col.bind(minimum_height=col.setter("height"))
+        for r in recips:
+            b = RoundedButton(text=r["name"], bg=CARD2, fg=TEXT, border=BORDER,
+                              size_hint_y=None, height=dp(60), font_size="16sp")
+            b.bind(on_release=lambda *a, num=r["number"]:
+                   self._gal_do_mms(pp, entries, num))
+            col.add_widget(b)
+        scroll.add_widget(col)
+        content.add_widget(scroll)
+        cancel = RoundedButton(text="ОТМЕНА", bg=BTN2, fg=TEXT, border=BORDER,
+                               size_hint_y=None, height=dp(52), font_size="13sp")
+        cancel.bind(on_release=lambda *a: pp.dismiss())
+        content.add_widget(cancel)
+        pp.open()
+
+    def _gal_do_mms(self, pp, entries, number):
+        pp.dismiss()
+        toast("Готовлю отправку...")
+        self.clear_sel_gal()
+
+        def work():
+            paths = [stamped_image_path(e.get("file", ""), e.get("caption", ""),
+                                        e.get("comment", ""), meter_text(e))
+                     for e in entries]
+            send_mms_multiple(paths, number)
+        threading.Thread(target=work, daemon=True).start()
+
+    def _load_thumb_async(self, src, thumb):
+        def work():
+            tp = make_thumb(src)
+            if tp:
+                self._set_thumb(thumb, tp)
+        threading.Thread(target=work, daemon=True).start()
+
+    @mainthread
+    def _set_thumb(self, thumb, tp):
+        try:
+            thumb.source = tp
+            thumb.reload()
+        except Exception:
+            pass
+
+    def open_day(self, day):
+        self.day = day
+        self._warmed = None
+        self.selected = []
+        self.rebuild()
+
+    def back_to_days(self):
+        self.day = None
+        self._warmed = None
+        self.selected = []
+        self.rebuild()
+
+    def open_photo(self, entry):
+        """Просмотр фото: увеличивается двумя пальцами.
+        Правка спрятана под кнопкой РЕДАКТИРОВАТЬ."""
+        box = BoxLayout(orientation="vertical", spacing=dp(8), padding=dp(6))
+
+        frame = ZoomFrame()
+        img = frame.img
+        box.add_widget(frame)
+
+        def refresh_img():
+            cap = entry.get("caption", "")
+            com = entry.get("comment", "")
+            mtx = meter_text(entry)
+            src = entry.get("file", "")
+            ready = stamped_ready(src, cap, com, mtx)
+            if ready:
+                img.source = ready
+                img.reload()
+            else:
+                quick = cached_thumb_path(src) or (src if os.path.exists(src)
+                                                   else None)
+                if quick:
+                    img.source = quick
+                self._prepare_stamped(src, cap, com, img, mtx)
+
+        refresh_img()
+
+        hint = body_label("Фото увеличивается двумя пальцами",
+                          color=MUTED, size="11sp", h=dp(18), halign="center")
+        box.add_widget(hint)
+
+        erow = BoxLayout(size_hint_y=None, height=dp(44), spacing=dp(6))
+
+        def show_edit(on):
+            erow.clear_widgets()
+            if not on:
+                eb = RoundedButton(text="РЕДАКТИРОВАТЬ", bg=BTN2, fg=TEXT,
+                                   border=BORDER, font_size="13sp")
+                eb.bind(on_release=lambda *a: show_edit(True))
+                erow.add_widget(eb)
+                return
+            ea = RoundedButton(text="АДРЕС", bg=H("#ffd166"), fg=DARKTX,
+                               font_size="12sp")
+            ea.bind(on_release=lambda *a: self.edit_address_gal(entry,
+                                                                refresh_img))
+            ec = RoundedButton(text="КОММЕНТ.", bg=BTN2, fg=TEXT,
+                               border=BORDER, font_size="12sp")
+            ec.bind(on_release=lambda *a: self.edit_field(
+                entry, "comment", "Изменить комментарий", "Комментарий",
+                refresh_img))
+            em = RoundedButton(text="ПОКАЗАНИЯ СЧЁТЧИКА", bg=BTN2,
+                               fg=TEXT, border=BORDER,
+                               font_size="10sp")
+            em.bind(on_release=lambda *a: edit_meter_dialog(entry, refresh_img))
+            erow.add_widget(ea)
+            erow.add_widget(ec)
+            erow.add_widget(em)
+
+        show_edit(False)
+        box.add_widget(erow)
+
+        back = RoundedButton(text="НАЗАД", bg=BACKC, fg=TEXT, border=None,
+                             size_hint_y=None, height=dp(46), font_size="15sp")
+        box.add_widget(back)
+        p = Popup(title="", content=box, size_hint=(0.98, 0.94),
+                  separator_height=0, background_color=(0, 0, 0, 1))
+        back.bind(on_release=lambda *a: p.dismiss())
+        p.open()
+
+    def edit_address_gal(self, entry, on_done=None):
+        st, ho, fl = parse_address(entry.get("caption", ""))
+        content = BoxLayout(orientation="vertical", spacing=dp(10), padding=dp(14))
+        s_in = make_input("Улица"); s_in.text = st
+        content.add_widget(s_in)
+        row0 = BoxLayout(size_hint_y=None, height=dp(56), spacing=dp(10))
+        h_in = make_num_input("Дом"); h_in.text = ho
+        f_in = make_num_input("Кв"); f_in.text = fl
+        row0.add_widget(h_in); row0.add_widget(f_in)
+        content.add_widget(row0)
+
+        pp = Popup(title="Изменить адрес", content=content,
+                   size_hint=(0.94, None), height=dp(280),
+                   pos_hint={"top": 0.98},
+                   title_color=TEXT, separator_color=ACCENT,
+                   background_color=(0.05, 0.05, 0.07, 1))
+
+        def save(*a):
+            val = build_address(s_in.text, h_in.text, f_in.text)
+            if val:
+                entry["caption"] = val
+            else:
+                entry.pop("caption", None)
+            app = App.get_running_app()
+            app.remember_address(val)
+            app.save()
+            warm_entry(entry)
+            pp.dismiss()
+            if on_done:
+                on_done()
+            self.rebuild()
+
+        row = BoxLayout(size_hint_y=None, height=dp(60), spacing=dp(12))
+        cancel = RoundedButton(text="ОТМЕНА", bg=BTN2, fg=TEXT, border=BORDER,
+                               font_size="15sp")
+        cancel.bind(on_release=lambda *a: pp.dismiss())
+        ok = RoundedButton(text="СОХРАНИТЬ", bg=ACCENT, fg=DARKTX, font_size="15sp")
+        ok.bind(on_release=save)
+        row.add_widget(cancel); row.add_widget(ok)
+        content.add_widget(row, index=len(content.children))  # кнопки над полем: иначе их закроет клавиатура
+        pp.open()
+
+    def edit_field(self, entry, key, title, hint, on_done=None):
+        content = BoxLayout(orientation="vertical", spacing=dp(12), padding=dp(14))
+        ti = make_input(hint)
+        ti.text = entry.get(key, "")
+        content.add_widget(ti)
+
+        pp = Popup(title=title, content=content,
+                   size_hint=(0.92, None), height=dp(220),
+                   pos_hint={"top": 0.98},
+                   title_color=TEXT, separator_color=ACCENT,
+                   background_color=(0.05, 0.05, 0.07, 1))
+
+        _skip7 = [False]
+
+        def _apply7(*a):
+            val = ti.text.strip()
+            if val:
+                entry[key] = val
+            else:
+                entry.pop(key, None)
+            App.get_running_app().save()
+            warm_entry(entry)
+
+        def save(*a):
+            _apply7()
+            _skip7[0] = True
+            pp.dismiss()
+            if on_done:
+                on_done()
+            self.rebuild()
+
+        def _cancel7(*a):
+            _skip7[0] = True
+            pp.dismiss()
+
+        def _dism7(*a):
+            if not _skip7[0]:
+                _apply7()
+                if on_done:
+                    on_done()
+                self.rebuild()
+            return False
+
+        pp.bind(on_dismiss=_dism7)
+        ti.bind(on_text_validate=lambda *a: save())
+
+        row = BoxLayout(size_hint_y=None, height=dp(64), spacing=dp(12))
+        cancel = RoundedButton(text="ОТМЕНА", bg=BTN2, fg=TEXT, border=BORDER,
+                               font_size="15sp")
+        cancel.bind(on_release=_cancel7)
+        ok = RoundedButton(text="СОХРАНИТЬ", bg=ACCENT, fg=DARKTX, font_size="15sp")
+        ok.bind(on_release=save)
+        row.add_widget(cancel)
+        row.add_widget(ok)
+        content.add_widget(row, index=len(content.children))  # кнопки над полем: иначе их закроет клавиатура
+        pp.open()
+
+    def _prepare_stamped(self, src, cap, com, img, mtx=""):
+        def work():
+            path = stamped_image_path(src, cap, com, mtx)
+            if path:
+                self._set_thumb(img, path)
+        threading.Thread(target=work, daemon=True).start()
+
+    def go_archive(self):
+        self.manager.transition.direction = "right"
+        self.manager.current = "archive"
+
+    def go_back(self):
+        if self.day is not None:
+            self.back_to_days()
+        else:
+            self.manager.transition.direction = "right"
+            self.manager.current = "archive"
+
+
+# =====================================================================
+#  ЭКРАН 6: НАСТРОЙКИ (режим MMS + управление адресатами)
+# =====================================================================
+
+class SettingsScreen(Screen):
+    def __init__(self, **kw):
+        super().__init__(**kw)
+        self.root = BoxLayout(orientation="vertical", padding=dp(16), spacing=dp(12))
+        self.add_widget(self.root)
+
+    def on_enter(self, *a):
+        self.rebuild()
+
+    def rebuild(self):
+        app = App.get_running_app()
+        self.root.clear_widgets()
+        self.root.add_widget(title_label("НАСТРОЙКИ", color=ACCENT, size="20sp"))
+
+        # Адрес по умолчанию — подставляется в каждое новое фото
+        self.root.add_widget(body_label("Адрес по умолчанию (для новых фото):",
+                                        color=TEXT, size="14sp", h=dp(28)))
+        adrow = BoxLayout(size_hint_y=None, height=dp(46), spacing=dp(8))
+        adr = Card(bg=CARD2, border=H("#ffd166"), orientation="vertical",
+                   padding=dp(8))
+        adr.add_widget(body_label(app.data.get("default_address")
+                                  or "Не задан",
+                                  color=H("#ffd166"), size="15sp",
+                                  h=dp(30), halign="center"))
+        adrow.add_widget(adr)
+        ab = RoundedButton(text="ИЗМ.", bg=H("#ffd166"), fg=DARKTX,
+                           size_hint_x=None, width=dp(62), font_size="12sp")
+        ab.bind(on_release=lambda *a: self.edit_default_address())
+        adrow.add_widget(ab)
+        self.root.add_widget(adrow)
+
+        self.root.add_widget(body_label("Показ адресатов MMS:",
+                                        color=TEXT, size="15sp", h=dp(30)))
+
+        mode = app.data.get("settings", {}).get("mms_mode", "list")
+        row = BoxLayout(size_hint_y=None, height=dp(72), spacing=dp(10))
+        b_list = RoundedButton(
+            text="СПИСОК ИМЁН",
+            bg=ACCENT if mode == "list" else CARD,
+            fg=DARKTX if mode == "list" else TEXT, border=BORDER, font_size="14sp")
+        b_list.bind(on_release=lambda *a: self.set_mode("list"))
+        b_last = RoundedButton(
+            text="ПОСЛЕДНИЙ + ПЛЮС",
+            bg=ACCENT if mode == "last" else CARD,
+            fg=DARKTX if mode == "last" else TEXT, border=BORDER, font_size="14sp")
+        b_last.bind(on_release=lambda *a: self.set_mode("last"))
+        row.add_widget(b_list)
+        row.add_widget(b_last)
+        self.root.add_widget(row)
+
+        self.root.add_widget(body_label("Адресаты для MMS (для MAX не нужны):",
+                                        color=TEXT,
+                                        size="15sp", h=dp(30)))
+
+        scroll = ScrollView()
+        col = GridLayout(cols=1, spacing=dp(10), size_hint_y=None, padding=[0, dp(4)])
+        col.bind(minimum_height=col.setter("height"))
+
+        recips = app.data.get("recipients", [])
+        if not recips:
+            col.add_widget(body_label("Список пуст.", color=MUTED,
+                                      size="14sp", h=dp(36)))
+        else:
+            for i, r in enumerate(recips):
+                line = Card(bg=CARD, orientation="horizontal", size_hint_y=None,
+                            height=dp(64), padding=dp(10), spacing=dp(8))
+                line.add_widget(body_label("%s  %s" % (r["name"], r["number"]),
+                                           color=TEXT, size="14sp", h=dp(44)))
+                ed = RoundedButton(text="ИЗМ.", bg=BTN2, fg=TEXT, border=BORDER,
+                                   size_hint_x=None, width=dp(66), font_size="13sp")
+                ed.bind(on_release=lambda *a, idx=i: self.edit_recipient(idx))
+                line.add_widget(ed)
+                d = RoundedButton(text="X", bg=DANGER, fg=TEXT,
+                                  size_hint_x=None, width=dp(56), font_size="15sp")
+                d.bind(on_release=lambda *a, idx=i: self.del_recipient(idx))
+                line.add_widget(d)
+                col.add_widget(line)
+
+        scroll.add_widget(col)
+        self.root.add_widget(scroll)
+
+        add = RoundedButton(text="+  ДОБАВИТЬ АДРЕСАТА", bg=ACCENT2, fg=TEXT,
+                            size_hint_y=None, height=dp(64), font_size="15sp")
+        add.bind(on_release=lambda *a: self.add_recipient())
+        self.root.add_widget(add)
+
+        back = RoundedButton(text="НАЗАД", bg=BACKC, fg=TEXT, border=None,
+                             size_hint_y=None, height=dp(64), font_size="15sp")
+        back.bind(on_release=lambda *a: self.go_back())
+        self.root.add_widget(back)
+
+    def edit_default_address(self):
+        """Адрес по умолчанию: улица, дом и квартира — отдельными полями."""
+        app = App.get_running_app()
+        st, ho, fl = parse_address(app.data.get("default_address", ""))
+
+        content = BoxLayout(orientation="vertical", spacing=dp(8),
+                            padding=dp(14))
+        content.add_widget(body_label("Улица:", color=MUTED, size="13sp",
+                                      h=dp(22)))
+        s_in = make_input("Улица")
+        s_in.text = st
+        content.add_widget(s_in)
+
+        content.add_widget(body_label("Дом и квартира:", color=MUTED,
+                                      size="13sp", h=dp(22)))
+        row0 = BoxLayout(size_hint_y=None, height=dp(48), spacing=dp(10))
+        h_in = make_num_input("Дом")
+        h_in.text = ho
+        f_in = make_num_input("Кв")
+        f_in.text = fl
+        row0.add_widget(h_in)
+        row0.add_widget(f_in)
+        content.add_widget(row0)
+
+        pp = Popup(title="Адрес по умолчанию", content=content,
+                   size_hint=(0.94, None), height=dp(320),
+                   pos_hint={"top": 0.98},
+                   title_color=TEXT, separator_color=ACCENT,
+                   background_color=(0.05, 0.05, 0.07, 1))
+
+        def save(*a):
+            app.data["default_address"] = build_address(
+                s_in.text, h_in.text, f_in.text)
+            app.save()
+            pp.dismiss()
+            self.rebuild()
+
+        row = BoxLayout(size_hint_y=None, height=dp(60), spacing=dp(12))
+        cancel = RoundedButton(text="ОТМЕНА", bg=BTN2, fg=TEXT, border=BORDER,
+                               font_size="15sp")
+        cancel.bind(on_release=lambda *a: pp.dismiss())
+        ok = RoundedButton(text="СОХРАНИТЬ", bg=ACCENT, fg=DARKTX,
+                           font_size="15sp")
+        ok.bind(on_release=save)
+        row.add_widget(cancel)
+        row.add_widget(ok)
+        content.add_widget(row, index=len(content.children))  # кнопки над полем: иначе их закроет клавиатура
+        pp.open()
+
+    def set_mode(self, mode):
+        app = App.get_running_app()
+        app.data.setdefault("settings", {})["mms_mode"] = mode
+        app.save()
+        self.rebuild()
+
+    def del_recipient(self, index):
+        app = App.get_running_app()
+        recips = app.data.get("recipients", [])
+        if 0 <= index < len(recips):
+            del recips[index]
+            if app.data.get("last_recipient", 0) >= len(recips):
+                app.data["last_recipient"] = 0
+            app.save()
+            self.rebuild()
+
+    def edit_recipient(self, index):
+        app = App.get_running_app()
+        recips = app.data.get("recipients", [])
+        if not (0 <= index < len(recips)):
+            return
+        r = recips[index]
+        content = BoxLayout(orientation="vertical", spacing=dp(12), padding=dp(14))
+        name_in = make_input("Имя")
+        name_in.text = r.get("name", "")
+        num_in = make_input("Номер (+7...)")
+        num_in.text = r.get("number", "")
+        content.add_widget(name_in)
+        content.add_widget(num_in)
+
+        popup = Popup(title="Изменить адресата", content=content,
+                      size_hint=(0.9, None), height=dp(300),
+                      pos_hint={"top": 0.98},
+                      title_color=TEXT, separator_color=ACCENT,
+                      background_color=(0.05, 0.05, 0.07, 1))
+
+        def save(*a):
+            name = name_in.text.strip()
+            num = num_in.text.strip()
+            if not name or not num:
+                return
+            recips[index] = {"name": name, "number": num}
+            app.save()
+            popup.dismiss()
+            self.rebuild()
+
+        row = BoxLayout(size_hint_y=None, height=dp(64), spacing=dp(12))
+        cancel = RoundedButton(text="ОТМЕНА", bg=BTN2, fg=TEXT, border=BORDER, font_size="15sp")
+        cancel.bind(on_release=lambda *a: popup.dismiss())
+        ok = RoundedButton(text="СОХРАНИТЬ", bg=ACCENT, fg=DARKTX, font_size="15sp")
+        ok.bind(on_release=save)
+        row.add_widget(cancel)
+        row.add_widget(ok)
+        content.add_widget(row, index=len(content.children))  # кнопки над полем: иначе их закроет клавиатура
+        popup.open()
+
+    def add_recipient(self):
+        app = App.get_running_app()
+        content = BoxLayout(orientation="vertical", spacing=dp(12), padding=dp(14))
+        name_in = make_input("Имя")
+        num_in = make_input("Номер (+7...)")
+        content.add_widget(name_in)
+        content.add_widget(num_in)
+
+        popup = Popup(title="Новый адресат", content=content,
+                      size_hint=(0.9, None), height=dp(300),
+                      pos_hint={"top": 0.98},
+                      title_color=TEXT, separator_color=ACCENT,
+                      background_color=(0.05, 0.05, 0.07, 1))
+
+        def save(*a):
+            name = name_in.text.strip()
+            num = num_in.text.strip()
+            if not name or not num:
+                return
+            app.data["recipients"].append({"name": name, "number": num})
+            app.save()
+            popup.dismiss()
+            self.rebuild()
+
+        row = BoxLayout(size_hint_y=None, height=dp(64), spacing=dp(12))
+        cancel = RoundedButton(text="ОТМЕНА", bg=BTN2, fg=TEXT, border=BORDER, font_size="15sp")
+        cancel.bind(on_release=lambda *a: popup.dismiss())
+        ok = RoundedButton(text="СОХРАНИТЬ", bg=ACCENT, fg=DARKTX, font_size="15sp")
+        ok.bind(on_release=save)
+        row.add_widget(cancel)
+        row.add_widget(ok)
+        content.add_widget(row, index=len(content.children))  # кнопки над полем: иначе их закроет клавиатура
+        popup.open()
+
+    def go_back(self):
+        self.manager.transition.direction = "right"
+        self.manager.current = "archive"
+
+# =====================================================================
+#  ПРИЛОЖЕНИЕ
+# =====================================================================
+
+class PhotoSenderApp(App):
+    def build(self):
+        self.title = "Фото-отправщик"
+        from kivy.core.window import Window as _Win
+        from kivy.uix.button import Button as _Btn
+        from kivy.uix.popup import Popup as _Pop
+        from kivy.uix.boxlayout import BoxLayout as _Box
+        from kivy.uix.label import Label as _Lab
+        from kivy.graphics import Color as _EC, Line as _EL
+        self._exit_btn = _Btn(background_normal="", background_down="", background_color=(0.16, 0.16, 0.2, 0.72), size_hint=(None, None), size=(dp(40), dp(40)))
+        def _place_exit(*_a):
+            self._exit_btn.pos = (_Win.width - dp(48), _Win.height - dp(55))
+        def _draw_x(*_a):
+            _b = self._exit_btn
+            _b.canvas.after.clear()
+            _cx = _b.center_x; _cy = _b.center_y; _s = dp(8)
+            with _b.canvas.after:
+                _EC(1, 1, 1, 0.30)
+                _EL(rounded_rectangle=(_b.x + 1, _b.y + 1,
+                                       _b.width - 2, _b.height - 2, dp(10)),
+                    width=1.2)
+                _EC(1, 1, 1, 0.85)
+                _EL(points=[_cx - _s, _cy - _s, _cx + _s, _cy + _s], width=2.0)
+                _EL(points=[_cx - _s, _cy + _s, _cx + _s, _cy - _s], width=2.0)
+        def _ask_exit(*_a):
+            _c = _Box(orientation="vertical", spacing=dp(12), padding=dp(16))
+            _c.add_widget(_Lab(text="Выйти из приложения?"))
+            _r = _Box(size_hint_y=None, height=dp(48), spacing=dp(12))
+            _no = _Btn(text="ОТМЕНА"); _yes = _Btn(text="ВЫЙТИ")
+            _r.add_widget(_no); _r.add_widget(_yes); _c.add_widget(_r)
+            _pp = _Pop(title="Выход", content=_c, size_hint=(0.82, None), height=dp(180))
+            _no.bind(on_release=lambda *a: _pp.dismiss())
+            _yes.bind(on_release=lambda *a: self.stop())
+            _pp.open()
+        self._exit_btn.bind(on_release=_ask_exit, pos=_draw_x, size=_draw_x)
+        _Win.bind(size=_place_exit)
+        _place_exit()
+        from kivy.clock import Clock as _Clk46
+        _Clk46.schedule_once(lambda *a: (_Win.add_widget(self._exit_btn), _place_exit(), _draw_x()), 0)
+        def _raise_exit(*_a):
+            try:
+                if self._exit_btn.parent is _Win:
+                    _Win.remove_widget(self._exit_btn)
+                _Win.add_widget(self._exit_btn)
+                _place_exit(); _draw_x()
+            except Exception:
+                pass
+        _Clk46.schedule_interval(_raise_exit, 0.5)
+        Window.clearcolor = BG
+        try:
+            # «resize»: экран ужимается под клавиатуру, и кнопки внизу
+            # остаются на виду. При «below_target» они прятались.
+            Window.softinput_mode = "resize"
+        except Exception:
+            pass
+
+        self.data = load_data()
+        self.current_photo = None
+        self.current_caption = ""
+        self.current_comment = ""
+        self.current_meter = ""
+        self.current_meter_type = ""
+        self._cam = None
+        self._cam_ev = None
+
+        Window.bind(on_keyboard=self._on_key)
+
+        sm = ScreenManager(transition=SlideTransition(duration=0.18))
+        sm.add_widget(CameraScreen(name="camera"))
+        sm.add_widget(ReviewScreen(name="review"))
+        sm.add_widget(SendMethodScreen(name="method"))
+        sm.add_widget(MMSScreen(name="mms"))
+        sm.add_widget(ArchiveScreen(name="archive"))
+        sm.add_widget(GalleryScreen(name="gallery"))
+        sm.add_widget(SettingsScreen(name="settings"))
+        self.sm = sm
+        return sm
+
+    def save(self):
+        save_data(self.data)
+
+    # --- Кнопка «назад» телефона: ходим внутри приложения, не выходим ---
+    def _on_key(self, window, key, *largs):
+        if key != 27:  # 27 = кнопка «назад» / Esc
+            return False
+        cur = self.sm.current
+        if cur == "review":
+            try:
+                if self.current_photo and os.path.exists(self.current_photo):
+                    os.remove(self.current_photo)
+            except Exception:
+                pass
+            self.current_photo = None
+            self.sm.transition.direction = "right"
+            self.sm.current = "camera"
+            return True
+        if cur == "method":
+            self.sm.transition.direction = "right"
+            self.sm.current = "review"
+            return True
+        if cur == "mms":
+            self.sm.transition.direction = "right"
+            self.sm.current = "method"
+            return True
+        if cur == "settings":
+            self.sm.transition.direction = "right"
+            self.sm.current = "archive"
+            return True
+        if cur == "gallery":
+            scr = self.sm.get_screen("gallery")
+            if getattr(scr, "selected", None):
+                scr.clear_sel_gal()
+                return True
+            scr.go_back()
+            return True
+        if cur == "archive":
+            scr = self.sm.get_screen("archive")
+            if getattr(scr, "selected", None):
+                scr.clear_selection()
+                return True
+            self.sm.transition.direction = "right"
+            self.sm.current = "camera"
+            return True
+        # На главной — разрешаем стандартное поведение (выход)
+        return False
+
+    # --- Управление съёмкой (запуск + ожидание результата) ---
+    def launch_camera(self, dest_path, on_done, status_cb):
+        self._cam = None
+        launch_native_camera(self, dest_path, on_done, status_cb)
+        if getattr(self, "_cam", None):
+            if self._cam_ev is not None:
+                self._cam_ev.cancel()
+            # Опрос на случай, если on_resume не сработает в Pydroid
+            self._cam_ev = Clock.schedule_interval(self._poll_camera, 1.0)
+
+    def _poll_camera(self, dt):
+        cam = getattr(self, "_cam", None)
+        if not cam:
+            return False
+        cam["tries"] += 1
+        try:
+            ok = finish_native_camera(cam["activity"], cam["uri"], cam["dest"])
+        except Exception as e:
+            print("poll err:", e)
+            ok = False
+        if ok:
+            cb = cam["cb"]
+            self._cam = None
+            cb(cam["dest"])
+            return False
+        if cam["tries"] > 180:   # ~3 минуты ожидания — прекращаем
+            self._cam = None
+            return False
+        return True
+
+    def on_resume(self):
+        # Камера вернула управление — сразу проверяем результат
+        self._poll_camera(0)
+        return True
+
+    def on_pause(self):
+        return True
+
+    def remember_address(self, addr):
+        """Ничего не запоминает — и это осознанно.
+        Адрес по умолчанию задаётся только в НАСТРОЙКАХ и живёт там.
+        Правка адреса у конкретного фото разовая: меняет только это
+        фото, настройки остаются как были."""
+        return
+
+    def add_to_archive(self, method, recipient):
+        """Добавить текущее фото в архив (с попыткой прочитать геометку)."""
+        if not self.current_photo:
+            return
+        entry = {
+            "file": self.current_photo,
+            "date": datetime.now().strftime("%d.%m.%Y  %H:%M"),
+            "recipient": recipient,
+            "method": method,
+        }
+        cap = getattr(self, "current_caption", "") or ""
+        if cap:
+            entry["caption"] = cap
+        com = getattr(self, "current_comment", "") or ""
+        if com:
+            entry["comment"] = com
+        mt = getattr(self, "current_meter", "") or ""
+        mtp = getattr(self, "current_meter_type", "") or ""
+        if mt:
+            entry["meter"] = mt
+        if mtp:
+            entry["meter_type"] = mtp
+        gps = read_gps(self.current_photo)
+        if gps:
+            entry["lat"] = gps[0]
+            entry["lon"] = gps[1]
+        self.data["archive"].append(entry)
+        self.current_caption = ""
+        self.current_comment = ""
+        self.current_meter = ""
+        self.save()
+        # Заранее готовим фото с плашкой и миниатюру — просмотр не будет ждать
+        f = entry.get("file")
+        c1 = entry.get("caption", "")
+        c2 = entry.get("comment", "")
+        c3 = meter_text(entry)
+
+        def _warm():
+            try:
+                make_thumb(f)
+                stamped_image_path(f, c1, c2, c3)
+            except Exception as ex:
+                print("warm:", ex)
+        threading.Thread(target=_warm, daemon=True).start()
+
+
+if __name__ == "__main__":
+    PhotoSenderApp().run()
+
+# =====================================================================
+#  ЗАМЕТКИ ДЛЯ ДОРАБОТКИ (когда будем делать APK):
+#   1) КАМЕРА: вызывается напрямую через jnius + MediaStore (штатная
+#      камера). plyer НЕ нужен. Фото сохраняется в наш архив, а временная
+#      запись в галерее удаляется. Если камера не открылась — текст ошибки
+#      покажется прямо на экране (пришли скриншот, поправлю точечно).
+#   2) РАЗРЕШЕНИЯ: на устройстве нужны разрешения на камеру и
+#      хранилище/фото. В Pydroid они обычно уже есть; в APK их нужно
+#      будет запрашивать (android.permission.CAMERA и др.).
+#   3) ПОДЕЛИТЬСЯ / MMS: на Android 7+ вместо Uri.fromFile обычно
+#      требуется FileProvider (иначе может быть ошибка доступа к файлу).
+#      Для APK это добавим. В Pydroid чаще работает и так.
+#   4) ГЕО-АДРЕС: чтение GPS требует Pillow (PIL). Адрес по координатам
+#      требует интернета (Nominatim/OpenStreetMap). Нет — просто
+#      показываются координаты или «Без геометки».
+#   5) Всё в блоках Android/гео обёрнуто в try/except — при отсутствии
+#      любой из возможностей приложение не падает.
+# =====================================================================
